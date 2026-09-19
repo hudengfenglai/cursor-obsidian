@@ -183,9 +183,9 @@ def score_cursor_window(hwnd: int, *, title: str | None = None) -> dict[str, Any
         editor_score += 1
         signals.append("title_editorish")
     if _TITLE_CURSOR_ONLY_RE.match(title or ""):
-        if agent_score == 0:
-            editor_score += 1
-            signals.append("title_cursor_only")
+        # Bare "Cursor" is ambiguous (Agents Window often uses this title).
+        # Do not bias toward EDITOR — leave UNKNOWN unless other signals fire.
+        signals.append("title_cursor_only_ambiguous")
 
     # Native menu markers (strong ±2) — often empty on Electron
     labels = [_normalize_menu_label(x) for x in _menu_labels(hwnd)]
@@ -255,6 +255,39 @@ def list_cursor_top_level(process_name: str = "Cursor.exe") -> list[dict[str, An
     return out
 
 
+def apply_companion_agent_heuristic(
+    classified: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """If exactly one EDITOR and exactly one other top-level Cursor window, that
+    companion is the Agents Window (product: at most one Agents Window).
+
+    Electron Agents titles are often just "Cursor" → UNKNOWN without this.
+    """
+    if not classified:
+        return classified
+    editors = [w for w in classified if str(w.get("role") or "") == ROLE_EDITOR]
+    others = [w for w in classified if str(w.get("role") or "") != ROLE_EDITOR]
+    if len(editors) != 1 or len(others) != 1:
+        return classified
+    companion = others[0]
+    if str(companion.get("role") or "") == ROLE_AGENT:
+        return classified
+    promoted = dict(companion)
+    promoted["role"] = ROLE_AGENT
+    promoted["agent_score"] = max(int(promoted.get("agent_score") or 0), CLASSIFY_THRESHOLD)
+    sigs = list(promoted.get("signals") or [])
+    if "sole_companion_of_editor" not in sigs:
+        sigs.append("sole_companion_of_editor")
+    promoted["signals"] = sigs
+    out: list[dict[str, Any]] = []
+    for w in classified:
+        if int(w.get("hwnd") or 0) == int(promoted.get("hwnd") or 0):
+            out.append(promoted)
+        else:
+            out.append(w)
+    return out
+
+
 def list_cursor_windows_classified(
     process_name: str = "Cursor.exe",
     *,
@@ -274,7 +307,7 @@ def list_cursor_windows_classified(
             }
         )
         out.append(merged)
-    return out
+    return apply_companion_agent_heuristic(out)
 
 
 def hwnd_set(windows: list[dict[str, Any]] | None) -> set[int]:

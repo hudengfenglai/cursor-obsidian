@@ -545,8 +545,78 @@ def hide_window(hwnd: int) -> None:
     win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
 
 
+def force_foreground(hwnd: int, *, retries: int = 3) -> bool:
+    """Bring hwnd to foreground reliably enough for SendInput (AttachThreadInput).
+
+    Electron ignores accelerators unless it actually owns the foreground.
+    Returns True iff GetForegroundWindow() == hwnd after attempts.
+    """
+    hwnd = int(hwnd or 0)
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        else:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+    except Exception:
+        pass
+
+    for _ in range(max(1, int(retries))):
+        try:
+            if int(win32gui.GetForegroundWindow() or 0) == hwnd:
+                return True
+        except Exception:
+            pass
+        try:
+            fg = int(win32gui.GetForegroundWindow() or 0)
+            cur_tid = int(win32api.GetCurrentThreadId())
+            fg_tid = 0
+            tgt_tid = 0
+            if fg:
+                fg_tid, _ = win32process.GetWindowThreadProcessId(fg)
+            tgt_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
+            attached_fg = False
+            attached_tgt = False
+            try:
+                if fg_tid and fg_tid != cur_tid:
+                    attached_fg = bool(user32.AttachThreadInput(cur_tid, int(fg_tid), True))
+                if tgt_tid and tgt_tid != cur_tid and tgt_tid != fg_tid:
+                    attached_tgt = bool(user32.AttachThreadInput(cur_tid, int(tgt_tid), True))
+                try:
+                    user32.BringWindowToTop(hwnd)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(user32, "SwitchToThisWindow"):
+                        user32.SwitchToThisWindow(hwnd, True)
+                except Exception:
+                    pass
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached_tgt:
+                    user32.AttachThreadInput(cur_tid, int(tgt_tid), False)
+                if attached_fg:
+                    user32.AttachThreadInput(cur_tid, int(fg_tid), False)
+        except Exception:
+            try:
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        time.sleep(0.08)
+        try:
+            if int(win32gui.GetForegroundWindow() or 0) == hwnd:
+                return True
+        except Exception:
+            pass
+    try:
+        return int(win32gui.GetForegroundWindow() or 0) == hwnd
+    except Exception:
+        return False
+
+
 def focus_window(hwnd: int) -> None:
-    show_window(hwnd)
+    force_foreground(hwnd)
 
 
 def get_foreground_hwnd() -> int:
@@ -563,8 +633,7 @@ def restore_foreground_hwnd(hwnd: int) -> bool:
     try:
         if not win32gui.IsWindow(int(hwnd)):
             return False
-        user32.SetForegroundWindow(int(hwnd))
-        return True
+        return force_foreground(int(hwnd), retries=2)
     except Exception:
         return False
 

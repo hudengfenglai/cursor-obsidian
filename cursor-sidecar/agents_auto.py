@@ -33,7 +33,7 @@ from cursor_windows import (
     refresh_cursor_bindings,
     show_window_noactivate,
 )
-from window import focus_window, get_foreground_hwnd, restore_foreground_hwnd
+from window import force_foreground, get_foreground_hwnd, restore_foreground_hwnd
 
 log = logging.getLogger("cursor_sidecar.agents_auto")
 
@@ -52,6 +52,7 @@ KEYEVENTF_UNICODE = 0x0004
 _PALETTE_QUERIES = (
     "New Agents Window",
     "File: New Agents Window",
+    "Developer: New Additional Agents Window",
 )
 
 
@@ -153,12 +154,29 @@ def trigger_agents_window_via_palette(
     q = (query or _PALETTE_QUERIES[0]).strip()
     prev = get_foreground_hwnd()
     try:
-        focus_window(eh)
-        time.sleep(0.25)
+        if not force_foreground(eh, retries=4):
+            return {
+                "ok": False,
+                "error": "focus_failed",
+                "trigger_method": "command_palette",
+                "query": q,
+                "foreground": get_foreground_hwnd(),
+                "editor_hwnd": eh,
+            }
+        time.sleep(0.2)
         dismiss_palette()
         time.sleep(0.1)
+        if not force_foreground(eh, retries=2):
+            return {
+                "ok": False,
+                "error": "focus_failed",
+                "trigger_method": "command_palette",
+                "query": q,
+                "foreground": get_foreground_hwnd(),
+                "editor_hwnd": eh,
+            }
         open_command_palette()
-        time.sleep(0.5)  # let palette UI mount
+        time.sleep(0.55)  # let palette UI mount
         chord([VK_CONTROL, ord("A")], pause=0.05)
         # Clipboard paste is more reliable than per-char Unicode SendInput in Electron
         pasted = False
@@ -175,9 +193,9 @@ def trigger_agents_window_via_palette(
             pasted = True
         except Exception:
             type_text(q)
-        time.sleep(0.65)  # let fuzzy filter settle on exact top hit
+        time.sleep(0.7)  # let fuzzy filter settle on exact top hit
         tap_vk(VK_RETURN, pause=0.2)
-        time.sleep(0.45)
+        time.sleep(0.5)
         return {
             "ok": True,
             "keys_sent": True,
@@ -185,6 +203,7 @@ def trigger_agents_window_via_palette(
             "query": q,
             "pasted": pasted,
             "prev_foreground": prev,
+            "foreground": get_foreground_hwnd(),
         }
     except Exception as exc:
         return {
@@ -201,20 +220,28 @@ def trigger_agents_window_via_alt_file_menu(editor_hwnd_i: int) -> dict[str, Any
     if not eh or not win32gui.IsWindow(eh):
         return {"ok": False, "error": "editor_hwnd_invalid"}
     try:
-        focus_window(eh)
+        if not force_foreground(eh, retries=4):
+            return {
+                "ok": False,
+                "error": "focus_failed",
+                "trigger_method": "alt_file_menu",
+                "foreground": get_foreground_hwnd(),
+                "editor_hwnd": eh,
+            }
         time.sleep(0.2)
         dismiss_palette()
         # Sequential Alt then F (more reliable than Alt+F chord on Electron)
         tap_vk(VK_MENU, pause=0.15)
-        tap_vk(ord("F"), pause=0.45)
-        type_text("New Agents Window", pause=0.025)
-        time.sleep(0.4)
+        tap_vk(ord("F"), pause=0.5)
+        type_text("New Agents Window", pause=0.03)
+        time.sleep(0.45)
         tap_vk(VK_RETURN, pause=0.2)
-        time.sleep(0.4)
+        time.sleep(0.5)
         return {
             "ok": True,
             "keys_sent": True,
             "trigger_method": "alt_file_menu",
+            "foreground": get_foreground_hwnd(),
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "trigger_method": "alt_file_menu"}

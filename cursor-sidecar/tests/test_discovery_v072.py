@@ -231,6 +231,29 @@ def test_cursor_agents_title_classifies_agent(monkeypatch):
     assert r["role"] == ROLE_AGENT
 
 
+def test_bare_cursor_title_is_ambiguous(monkeypatch):
+    monkeypatch.setattr("cursor_windows.win32gui.IsWindow", lambda _h: True)
+    monkeypatch.setattr("cursor_windows._menu_labels", lambda _h: [])
+    monkeypatch.setattr("cursor_windows._uia_name_hits", lambda _h: {})
+    from cursor_windows import score_cursor_window, ROLE_UNKNOWN
+
+    r = score_cursor_window(1, title="Cursor")
+    assert r["role"] == ROLE_UNKNOWN
+    assert "title_cursor_only_ambiguous" in r["signals"]
+
+
+def test_companion_of_editor_promoted_to_agent():
+    from cursor_windows import ROLE_AGENT, ROLE_EDITOR, apply_companion_agent_heuristic
+
+    classified = [
+        {"hwnd": 10, "role": ROLE_EDITOR, "title": "a.py - repo - Cursor", "signals": []},
+        {"hwnd": 20, "role": ROLE_UNKNOWN, "title": "Cursor", "agent_score": 0, "signals": []},
+    ]
+    out = apply_companion_agent_heuristic(classified)
+    assert out[1]["role"] == ROLE_AGENT
+    assert "sole_companion_of_editor" in out[1]["signals"]
+
+
 def test_wait_sole_newcomer_non_editor():
     before = [{"hwnd": 10}]
     n = {"i": 0}
