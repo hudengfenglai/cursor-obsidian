@@ -201,14 +201,20 @@ def wait_for_agent_classified(
     poll_s: float = 0.15,
     classify_list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Success: unique AGENT, optionally new HWND or newly classifiable/visible."""
+    """
+    Success:
+      A) unique ROLE_AGENT, or
+      B) exactly one new non-EDITOR HWND (Electron Agents often stays UNKNOWN briefly)
+    Aux HWNDs that are not the sole newcomer are ignored.
+    """
     classify_list_fn = classify_list_fn or list_cursor_windows_classified
     before_ids = {int(w.get("hwnd") or 0) for w in before}
+    eh = int(editor_hwnd_i or 0)
     deadline = time.time() + float(timeout_s)
     last: dict[str, Any] = {}
     while time.time() < deadline:
         classified = classify_list_fn(process_name)
-        agents = agent_candidates(classified, exclude_hwnd=int(editor_hwnd_i or 0))
+        agents = agent_candidates(classified, exclude_hwnd=eh)
         counts = _diag_counts(classified)
         last = {
             "after_cursor_windows": classified,
@@ -220,6 +226,7 @@ def wait_for_agent_classified(
                 "ok": True,
                 "candidate": cand,
                 "new_hwnd": int(cand.get("hwnd") or 0) not in before_ids,
+                "match": "classified_agent",
                 **last,
             }
         if len(agents) > 1:
@@ -227,6 +234,24 @@ def wait_for_agent_classified(
                 "ok": False,
                 "error": "agent_window_ambiguous",
                 "candidates": agents,
+                **last,
+            }
+
+        # Soft path: sole newcomer that is not EDITOR (and not the bound editor hwnd)
+        newcomers = [
+            w
+            for w in classified
+            if int(w.get("hwnd") or 0) not in before_ids
+            and int(w.get("hwnd") or 0) != eh
+            and str(w.get("role") or "") != "EDITOR"
+        ]
+        if len(newcomers) == 1:
+            cand = newcomers[0]
+            return {
+                "ok": True,
+                "candidate": cand,
+                "new_hwnd": True,
+                "match": "sole_newcomer_non_editor",
                 **last,
             }
         time.sleep(poll_s)

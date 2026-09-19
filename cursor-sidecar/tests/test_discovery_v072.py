@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from agents_auto import ensure_agents_window_bound, find_existing_agent, wait_for_agent_classified
+from cursor_exe import resolve_cursor_executable
+from agents_menu import normalize_menu_label
 from cursor_windows import (
     ROLE_AGENT,
     ROLE_EDITOR,
@@ -13,9 +16,6 @@ from cursor_windows import (
     refresh_cursor_bindings,
     select_editor_window,
 )
-from agents_auto import ensure_agents_window_bound, find_existing_agent, wait_for_agent_classified
-from cursor_exe import resolve_cursor_executable
-from agents_menu import normalize_menu_label
 
 
 def test_agent_never_in_editor_candidates():
@@ -209,15 +209,49 @@ def test_persisted_verified_exe(monkeypatch, tmp_path_factory):
     assert r["source"] == "persisted_verified"
 
 
-def test_clear_helpers_independent():
-    state = {
-        "cursor_editor": {"hwnd": 1},
-        "cursor_agent": {"hwnd": 2},
-        "embedded": True,
-        "native_child": True,
-    }
-    clear_agent_binding(state, reason="x")
-    assert state["cursor_editor"]["hwnd"] == 1
-    assert state["cursor_agent"] is None
-    clear_editor_binding(state, reason="y")
-    assert state["cursor_editor"] is None
+def test_electron_editor_title_classifies_editor(monkeypatch):
+    monkeypatch.setattr("cursor_windows.win32gui.IsWindow", lambda _h: True)
+    monkeypatch.setattr("cursor_windows._menu_labels", lambda _h: [])
+    monkeypatch.setattr("cursor_windows._uia_name_hits", lambda _h: {})
+    from cursor_windows import score_cursor_window, ROLE_EDITOR
+
+    r = score_cursor_window(1, title="init_skill.py - cursor-obsidian - Cursor")
+    assert r["role"] == ROLE_EDITOR
+    assert r["editor_score"] >= 2
+    assert "title_electron_editor" in r["signals"]
+
+
+def test_cursor_agents_title_classifies_agent(monkeypatch):
+    monkeypatch.setattr("cursor_windows.win32gui.IsWindow", lambda _h: True)
+    monkeypatch.setattr("cursor_windows._menu_labels", lambda _h: [])
+    monkeypatch.setattr("cursor_windows._uia_name_hits", lambda _h: {})
+    from cursor_windows import score_cursor_window, ROLE_AGENT
+
+    r = score_cursor_window(1, title="Cursor Agents")
+    assert r["role"] == ROLE_AGENT
+
+
+def test_wait_sole_newcomer_non_editor():
+    before = [{"hwnd": 10}]
+    n = {"i": 0}
+
+    def classify(_p):
+        n["i"] += 1
+        if n["i"] < 2:
+            return [{"hwnd": 10, "role": ROLE_EDITOR}]
+        return [
+            {"hwnd": 10, "role": ROLE_EDITOR},
+            {"hwnd": 99, "role": "UNKNOWN", "title": "Cursor"},
+        ]
+
+    r = wait_for_agent_classified(
+        process_name="Cursor.exe",
+        editor_hwnd_i=10,
+        before=before,
+        timeout_s=1.0,
+        poll_s=0.01,
+        classify_list_fn=classify,
+    )
+    assert r["ok"] is True
+    assert r["candidate"]["hwnd"] == 99
+    assert r["match"] == "sole_newcomer_non_editor"

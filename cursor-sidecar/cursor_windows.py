@@ -30,7 +30,14 @@ ROLE_UNKNOWN = "UNKNOWN"
 CLASSIFY_THRESHOLD = 2
 
 _TITLE_AGENT_RE = re.compile(r"\bagents?\b", re.I)
-_TITLE_EDITOR_RE = re.compile(r"\b(editor|welcome|untitled|\.md|\.py|\.ts|\.js)\b", re.I)
+_TITLE_EDITOR_RE = re.compile(
+    r"\b(editor|welcome|untitled|\.md|\.py|\.ts|\.tsx|\.js|\.jsx|\.json|\.rs|\.go)\b",
+    re.I,
+)
+# Classic VS Code / Cursor title: "file - folder - Cursor"
+_TITLE_ELECTRON_EDITOR_RE = re.compile(r".+\s+-\s+.+\s+-\s+Cursor\s*$", re.I)
+_TITLE_CURSOR_ONLY_RE = re.compile(r"^Cursor\s*$", re.I)
+_TITLE_AGENTS_PRODUCT_RE = re.compile(r"^Cursor\s+Agents?\b|\bAgents?\s+Window\b", re.I)
 
 
 def migrate_cursor_roles(state: dict[str, Any]) -> dict[str, Any]:
@@ -156,24 +163,37 @@ def score_cursor_window(hwnd: int, *, title: str | None = None) -> dict[str, Any
             title = win32gui.GetWindowText(hwnd) or ""
         except Exception:
             title = ""
-    title_l = (title or "").lower()
+    title_l = (title or "").lower().strip()
 
-    # Weak title signals (±1)
-    if _TITLE_AGENT_RE.search(title_l) and "editor" not in title_l:
+    # --- Title signals (Electron often has no Win32 menu; titles must carry weight) ---
+    if _TITLE_AGENTS_PRODUCT_RE.search(title or "") or (
+        _TITLE_AGENT_RE.search(title_l) and " - " not in title_l
+    ):
+        agent_score += 2
+        signals.append("title_agents_product")
+    elif _TITLE_AGENT_RE.search(title_l) and "editor" not in title_l:
         agent_score += 1
         signals.append("title_agents")
+
+    if _TITLE_ELECTRON_EDITOR_RE.match(title or ""):
+        # e.g. "init_skill.py - cursor-obsidian - Cursor"
+        editor_score += 2
+        signals.append("title_electron_editor")
     if _TITLE_EDITOR_RE.search(title_l) and "agent" not in title_l:
         editor_score += 1
         signals.append("title_editorish")
+    if _TITLE_CURSOR_ONLY_RE.match(title or ""):
+        if agent_score == 0:
+            editor_score += 1
+            signals.append("title_cursor_only")
 
-    # Native menu markers (strong ±2)
+    # Native menu markers (strong ±2) — often empty on Electron
     labels = [_normalize_menu_label(x) for x in _menu_labels(hwnd)]
     joined = " | ".join(labels)
     if any("new agents window" in x for x in labels) or "new agents window" in joined:
         editor_score += 2
         signals.append("menu_new_agents")
     if any(x == "agents window" or x.endswith("agents window") for x in labels):
-        # File → Agents Window / New Agents Window present → Editor surface
         if not any("new agents" in x for x in labels):
             editor_score += 1
             signals.append("menu_agents_entry")
@@ -181,7 +201,6 @@ def score_cursor_window(hwnd: int, *, title: str | None = None) -> dict[str, Any
         agent_score += 2
         signals.append("menu_open_editor")
     if any("new agent" == x or x.startswith("new agent ") for x in labels):
-        # Agents-surface File menu often has New Agent (singular)
         agent_score += 1
         signals.append("menu_new_agent")
 
@@ -200,7 +219,6 @@ def score_cursor_window(hwnd: int, *, title: str | None = None) -> dict[str, Any
     elif agent_score >= CLASSIFY_THRESHOLD and agent_score > editor_score:
         role = ROLE_AGENT
     elif editor_score >= CLASSIFY_THRESHOLD and agent_score >= CLASSIFY_THRESHOLD:
-        # Tie at threshold → UNKNOWN (do not guess)
         role = ROLE_UNKNOWN
         signals.append("score_tie")
 
