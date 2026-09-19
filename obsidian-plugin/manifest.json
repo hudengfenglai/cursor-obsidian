@@ -1,9 +1,9 @@
 {
   "id": "cursor-sidecar",
   "name": "Cursor Sidecar",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "minAppVersion": "1.5.0",
-  "description": "Attach/Detach Cursor Desktop beside Obsidian with safe restore (v0.2.1).",
+  "description": "Live Sidecar: Cursor Desktop follows Obsidian while attached (v0.3).",
   "author": "hudengfenglai",
   "authorUrl": "https://github.com/hudengfenglai/cursor-obsidian",
   "isDesktopOnly": true

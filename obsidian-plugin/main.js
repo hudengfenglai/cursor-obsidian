@@ -16,14 +16,19 @@ const DEFAULT_SETTINGS = {
   pythonPath: "",
   daemonHost: "127.0.0.1",
   daemonPort: 27845,
-  useDaemon: false,
+  liveSidecar: true,
   openVaultInCursor: true,
   showNotices: true,
 };
 
 class CursorSidecarPlugin extends Plugin {
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const saved = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved || {});
+    // Migrate v0.2.1 useDaemon → liveSidecar
+    if (saved && saved.liveSidecar === undefined && saved.useDaemon !== undefined) {
+      this.settings.liveSidecar = !!saved.useDaemon;
+    }
     addIcon(ICON_ID, ICON_SVG);
 
     this.addRibbonIcon(ICON_ID, "Cursor Sidecar: Attach / Detach", async () => {
@@ -50,6 +55,21 @@ class CursorSidecarPlugin extends Plugin {
       id: "cursor-sidecar-arrange",
       name: "Arrange Sidecar",
       callback: async () => this.runAction("arrange"),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-compact",
+      name: "Cursor Sidecar: Compact",
+      callback: async () => this.runAction("compact"),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-normal",
+      name: "Cursor Sidecar: Normal",
+      callback: async () => this.runAction("normal"),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-wide",
+      name: "Cursor Sidecar: Wide",
+      callback: async () => this.runAction("wide"),
     });
     this.addCommand({
       id: "cursor-sidecar-focus",
@@ -138,8 +158,8 @@ class CursorSidecarPlugin extends Plugin {
       [this.resolveMainPy(), "daemon-start"],
       this.settings.sidecarDir
     );
-    for (let i = 0; i < 10; i++) {
-      await sleep(200);
+    for (let i = 0; i < 15; i++) {
+      await sleep(250);
       if (await this.daemonHealthy()) return true;
     }
     return false;
@@ -214,7 +234,7 @@ class CursorSidecarPlugin extends Plugin {
     if (!this.pathsConfigured()) return null;
     this.notify(`Cursor Sidecar: ${cmd}…`);
     try {
-      if (this.settings.useDaemon) {
+      if (this.settings.liveSidecar) {
         const up = await this.ensureDaemon();
         if (up) {
           const result =
@@ -228,6 +248,8 @@ class CursorSidecarPlugin extends Plugin {
           }
           if (showRaw || cmd === "status") {
             this.notify(`Cursor Sidecar: ${JSON.stringify(result.status || result).slice(0, 280)}`);
+          } else if (cmd === "compact" || cmd === "normal" || cmd === "wide") {
+            this.notify(`Cursor Sidecar: preset ${cmd}`);
           } else if (result.attached === true) {
             this.notify("Cursor Sidecar: attached");
           } else if (result.attached === false) {
@@ -237,6 +259,7 @@ class CursorSidecarPlugin extends Plugin {
           }
           return result;
         }
+        this.notify("Cursor Sidecar: daemon unavailable — falling back to one-shot CLI", true);
       }
       return await this.runCli(cmd, showRaw);
     } catch (err) {
@@ -320,7 +343,7 @@ class CursorSidecarSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Cursor Sidecar" });
     containerEl.createEl("p", {
-      text: "Attach / Detach real Cursor Desktop beside Obsidian. Set Sidecar directory to the folder that contains main.py.",
+      text: "Attach real Cursor Desktop beside Obsidian. With Live Sidecar on, Cursor follows Obsidian while attached.",
     });
 
     new Setting(containerEl)
@@ -337,6 +360,16 @@ class CursorSidecarSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Live Sidecar")
+      .setDesc("When enabled, Cursor follows Obsidian while attached.")
+      .addToggle((toggle) =>
+        toggle.setValue(!!this.plugin.settings.liveSidecar).onChange(async (value) => {
+          this.plugin.settings.liveSidecar = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
       .setName("Python path")
       .setDesc("Optional. Defaults to sidecar .venv\\Scripts\\python.exe")
       .addText((text) =>
@@ -347,16 +380,6 @@ class CursorSidecarSettingTab extends PluginSettingTab {
             this.plugin.settings.pythonPath = value.trim();
             await this.plugin.saveSettings();
           })
-      );
-
-    new Setting(containerEl)
-      .setName("Use daemon (experimental)")
-      .setDesc("Off by default. Requires .sidecar.daemon.token; no browser CORS.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.useDaemon).onChange(async (value) => {
-          this.plugin.settings.useDaemon = value;
-          await this.plugin.saveSettings();
-        })
       );
 
     new Setting(containerEl)
@@ -375,6 +398,38 @@ class CursorSidecarSettingTab extends PluginSettingTab {
           this.plugin.settings.showNotices = value;
           await this.plugin.saveSettings();
         })
+      );
+
+    containerEl.createEl("h3", { text: "Advanced" });
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "Daemon host/port (usually leave defaults).",
+    });
+
+    new Setting(containerEl)
+      .setName("Daemon host")
+      .setDesc("localhost only")
+      .addText((text) =>
+        text
+          .setPlaceholder("127.0.0.1")
+          .setValue(this.plugin.settings.daemonHost)
+          .onChange(async (value) => {
+            this.plugin.settings.daemonHost = value.trim() || "127.0.0.1";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Daemon port")
+      .addText((text) =>
+        text
+          .setPlaceholder("27845")
+          .setValue(String(this.plugin.settings.daemonPort || 27845))
+          .onChange(async (value) => {
+            const n = Number(value);
+            this.plugin.settings.daemonPort = Number.isFinite(n) && n > 0 ? n : 27845;
+            await this.plugin.saveSettings();
+          })
       );
 
     new Setting(containerEl)

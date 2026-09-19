@@ -1,22 +1,39 @@
-# Cursor Sidecar v0.2.1 — Lifecycle + Safety Hardening
+# Cursor Sidecar v0.3 — Live Sidecar
 
-Dock the **real Cursor Desktop** beside Obsidian on Windows.
+Dock the **real Cursor Desktop** beside Obsidian on Windows, then keep Cursor
+stuck to Obsidian’s right edge while attached.
 
 ## Interaction
 
 ```text
-First click  → Attach (save originals + 70/30)
-Second click → Detach (restore exact bound windows only)
+Attach  → initial split by preset (default Normal = 70/30)
+Then    → Cursor follows Obsidian live via WinEventHook
+Detach  → restore exact bound windows to Attach-time placements
 ```
 
-If the bound Cursor HWND is gone, Detach returns `gone` and **does not** resize another Cursor window.
+Live Follow only moves **Cursor**. It never snaps Obsidian back to 70/30 while you drag.
 
-## Safety (v0.2.1)
+## Width presets
 
-- Binding: `hwnd + pid + process_name + process_create_time`
-- Legacy states without create_time still work; `status` marks `legacy_binding`
-- Atomic state write (`.tmp` → `os.replace`)
-- Daemon is **experimental**, default off; requires `X-Cursor-Sidecar-Token` (no CORS `*`)
+| Preset  | Obsidian | Cursor |
+|---------|----------|--------|
+| Compact | 78%      | 22%    |
+| Normal  | 70%      | 30%    |
+| Wide    | 58%      | 42%    |
+
+Presets apply on Attach, Arrange, and when you switch preset while attached.
+
+## Live Sidecar (daemon)
+
+v0.3 Live Follow uses the existing authenticated localhost daemon
+(`X-Cursor-Sidecar-Token`). No second background service.
+
+Obsidian setting **Live Sidecar** (replaces “Use daemon (experimental)”):
+
+- ON → ensure daemon; Cursor follows while attached
+- OFF → one-shot Attach / Detach via CLI still works
+
+`poll_ms` / `follow_obsidian` in `config.json` are **deprecated**. Live Follow does not use polling.
 
 ## Commands
 
@@ -24,39 +41,36 @@ If the bound Cursor HWND is gone, Detach returns `gone` and **does not** resize 
 python main.py attach
 python main.py detach
 python main.py click
+python main.py arrange
+python main.py compact|normal|wide
 python main.py status --json
+python main.py daemon
 ```
+
+## Safety (unchanged from v0.2.1)
+
+- Binding: `hwnd + pid + process_name + process_create_time`
+- No rediscovery of another Cursor on Detach / binding loss
+- Atomic state write
+- Daemon token auth (no CORS `*`)
 
 ## Tests
 
 ```powershell
 pytest
-python -m py_compile main.py window.py geometry.py acceptance_run.py
+python -m py_compile main.py window.py geometry.py win_events.py acceptance_run.py acceptance_live_follow.py
 node --check ../obsidian-plugin/main.js
 ```
 
 ## Acceptance testing
 
-`cursor-sidecar/acceptance_run.py` is a **Windows-only** acceptance harness (not a CI unit test).
-
-It refuses to run if Sidecar is currently **attached** (will not overwrite live restore state).  
-On exit it restores the exact Obsidian/Cursor placements captured at start, and restores `.sidecar.state.json`.
-
-It checks:
-
-- maximize → attach → detach restore
-- existing Cursor → attach (not hide)
-- bound HWND stability across arrange/focus
-- stale binding detection (`cursor_gone`, etc.)
-- do not restore another Cursor window when the bound one is gone
-- DPI / monitor work area via `MonitorFromWindow`
+Windows-only harnesses (not CI). Refuse to run if Sidecar is attached. Self-restoring (`try`/`finally`, exact HWND).
 
 ```powershell
-python acceptance_run.py
+python acceptance_run.py          # v0.2.1 lifecycle (6 scenarios)
+python acceptance_live_follow.py  # v0.3 live follow (A–F)
 ```
 
-Requires Obsidian and Cursor Desktop windows to be open, with Sidecar detached.
+## Out of scope (v0.4+)
 
-## Out of scope
-
-Live follow / WinEventHook / note sync / PyInstaller → v0.3+
+Note sync / Open current file / PyInstaller / SetParent / embedding / Cursor CLI / ACP

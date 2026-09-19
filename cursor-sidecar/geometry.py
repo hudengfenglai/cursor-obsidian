@@ -299,3 +299,150 @@ def recover_state_dict(raw: str | None) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+# ---- v0.3 Live Sidecar helpers (pure) ----
+
+WIDTH_PRESETS: dict[str, tuple[float, float]] = {
+    "compact": (0.78, 0.22),
+    "normal": (0.70, 0.30),
+    "wide": (0.58, 0.42),
+}
+
+
+def resolve_preset(name: str | None) -> str:
+    key = (name or "normal").strip().lower()
+    if key not in WIDTH_PRESETS:
+        raise ValueError(f"unknown preset: {name}")
+    return key
+
+
+def ratios_for_preset(name: str | None) -> tuple[float, float]:
+    return WIDTH_PRESETS[resolve_preset(name)]
+
+
+def clamp_rect_to_work(
+    rect: tuple[int, int, int, int],
+    work: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = (int(x) for x in rect)
+    wl, wt, wr, wb = (int(x) for x in work)
+    width = max(right - left, 1)
+    height = max(bottom - top, 1)
+    if left < wl:
+        left = wl
+    if top < wt:
+        top = wt
+    if left + width > wr:
+        left = max(wl, wr - width)
+        width = min(width, wr - wl)
+    if top + height > wb:
+        top = max(wt, wb - height)
+        height = min(height, wb - wt)
+    return (left, top, left + width, top + height)
+
+
+def compute_follow_cursor_rect(
+    obsidian: tuple[int, int, int, int],
+    *,
+    cursor_width: int,
+    gap: int,
+    work: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """
+    Stick Cursor to Obsidian's right edge. Never moves Obsidian.
+
+    Cursor.left = Obsidian.right + gap
+    Cursor.top / height match Obsidian (then clamp to work area).
+    If width would overflow the work area, shrink width (do not slide left over Obsidian).
+    """
+    ol, ot, oright, ob = (int(x) for x in obsidian)
+    wl, wt, wr, wb = (int(x) for x in work)
+    gap = max(int(gap), 0)
+    width = max(int(cursor_width), 1)
+    height = max(ob - ot, 1)
+    left = oright + gap
+    top = ot
+
+    if left < wl:
+        left = wl
+    if top < wt:
+        top = wt
+    if top + height > wb:
+        top = max(wt, wb - height)
+        height = min(height, wb - wt)
+
+    # Prefer sticking to Obsidian's right edge: shrink width instead of overlapping Obsidian
+    if left >= wr:
+        # No room to the right — park at work edge with minimal width
+        width = min(width, max(wr - wl, 1))
+        left = max(wl, wr - width)
+    else:
+        width = min(width, max(wr - left, 1))
+
+    return (left, top, left + width, top + height)
+
+
+def cursor_width_from_work(work: tuple[int, int, int, int], cursor_ratio: float, gap: int = 0) -> int:
+    wl, _wt, wr, _wb = work
+    usable = max((wr - wl) - max(int(gap), 0), 1)
+    return max(int(round(usable * float(cursor_ratio))), 1)
+
+
+class LatestOnlyDebouncer:
+    """Cancel-and-reschedule debounce; always prefers the newest call."""
+
+    def __init__(self, delay_s: float, callback):
+        import threading
+
+        self.delay_s = max(float(delay_s), 0.0)
+        self.callback = callback
+        self._lock = threading.Lock()
+        self._timer = None
+        self._pending = None
+
+    def trigger(self, *args, **kwargs) -> None:
+        import threading
+
+        payload = None
+        with self._lock:
+            self._pending = (args, kwargs)
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if self.delay_s <= 0:
+                payload = self._pending
+                self._pending = None
+            else:
+                self._timer = threading.Timer(self.delay_s, self._fire)
+                self._timer.daemon = True
+                self._timer.start()
+                return
+        if payload is not None:
+            a, k = payload
+            self.callback(*a, **k)
+
+    def flush(self, *args, **kwargs) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._pending = None
+        self.callback(*args, **kwargs)
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._pending = None
+
+    def _fire(self) -> None:
+        with self._lock:
+            payload = self._pending
+            self._pending = None
+            self._timer = None
+        if payload is None:
+            return
+        args, kwargs = payload
+        self.callback(*args, **kwargs)
