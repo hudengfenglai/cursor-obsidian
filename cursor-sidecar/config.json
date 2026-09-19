@@ -8,7 +8,9 @@
   "obsidian_title_hint": "Obsidian",
   "cursor_title_hint": "Cursor",
   "poll_ms": 500,
-  "follow_obsidian": true,
+  "follow_obsidian": false,
+  "daemon_host": "127.0.0.1",
+  "daemon_port": 27845,
   "launch_cursor_if_missing": true,
   "cursor_exe_candidates": [
     "%LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe",

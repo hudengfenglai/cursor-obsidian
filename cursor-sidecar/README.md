@@ -1,148 +1,101 @@
-# Cursor Sidecar (MVP)
+# Cursor Sidecar v0.2 — Lifecycle & Window Restore
 
-Windows helper that docks the **real Cursor Desktop** window to the right of Obsidian.
+Dock the **real Cursor Desktop** beside Obsidian on Windows.
 
-This does **not** embed, inject, or modify Cursor / Obsidian. Both remain separate processes; we only call Windows window APIs (`SetWindowPos`).
+This is **not** an embed. Cursor stays `Cursor.exe`. Obsidian only triggers a Win32 helper.
+
+## Interaction (core of v0.2)
 
 ```text
-Obsidian.exe  |  Cursor.exe
-   70%        |     30%
+First click  → Attach
+               save original WindowPlacement for both windows
+               Obsidian 70% | Cursor 30%
+
+Second click → Detach
+               restore both windows to pre-Attach state
 ```
 
-## Why
+**Acceptance:** If Obsidian was maximized before Attach, Detach must maximize it again.
 
-Keep Cursor Desktop features intact:
+Ribbon = **Attach / Detach**, not show/hide.
 
-- login / account switching (Editor mode)
-- Agent, Diff, Chat
-- Rules / Extensions
+Show/hide remains a separate command for debugging.
 
-Obsidian stays your knowledge OS; Cursor stays your commercial IDE client.
+## Why Attach ≠ Cursor running
 
-## Requirements
+If Cursor is already open but not attached, the first click must **Attach**, never hide Cursor.
 
-- Windows 10/11
-- Python 3.10+
-- Obsidian and Cursor Desktop installed
-
-```powershell
-cd cursor-sidecar
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+```text
+Cursor process running  ≠  Sidecar attached
 ```
-
-### Windows permissions
-
-Usually **no admin** is required.
-
-- Uses public Win32 APIs: `EnumWindows`, `GetWindowRect`, `SetWindowPos`, `ShowWindow`
-- Does **not** inject DLLs, hook input, or attach as a debugger
-- If antivirus blocks `python.exe` launching `Cursor.exe`, allowlist the script folder
-- If Cursor was started elevated and the sidecar is not (or vice versa), window moves may fail — run both at the same integrity level
-
-## Config (`config.json`)
-
-| Key | Meaning | Default |
-|-----|---------|---------|
-| `obsidian_ratio` | Left share | `0.7` |
-| `cursor_ratio` | Right share | `0.3` |
-| `gap` | Pixel gap between panes | `0` |
-| `monitor` | Monitor index, or `null`/`"auto"` to follow Obsidian | `0` |
-| `poll_ms` | Follow-loop interval | `500` |
-| `follow_obsidian` | `start` keeps re-arranging when Obsidian moves | `true` |
-| `launch_cursor_if_missing` | `start` launches Cursor | `true` |
-| `cursor_exe_candidates` | Paths searched when launching | see file |
-
-Edit ratios after you validate that a ~30% wide Cursor still works for Agent / Diff / account switch.
 
 ## Commands
 
 ```powershell
-# Discover windows
-python main.py status
+cd cursor-sidecar
+.\.venv\Scripts\Activate.ps1
 
-# One-shot arrange (Obsidian + Cursor must already be open)
-python main.py arrange
-
-# Launch Cursor if needed, arrange, then follow Obsidian moves
-python main.py start
-
-# Stop follow loop
-python main.py stop
-
-# Show / hide Cursor
-python main.py toggle
-```
-
-Optional config path:
-
-```powershell
-python main.py -c .\config.json arrange
-```
-
-## Suggested first test (before relying on sidecar)
-
-1. Open Cursor Editor (not maximized).
-2. Manually drag it to ~30% width on the right.
-3. Confirm: Agent, Diff, chat, account switch all still work.
-4. If yes → run `python main.py arrange`.
-
-## File layout
-
-```text
-cursor-sidecar/
-├── main.py              # CLI: start / arrange / stop / toggle / status
-├── window.py            # Find windows + SetWindowPos layout
-├── config.json          # Ratios, gap, monitor, process names
-├── requirements.txt     # pywin32, psutil
-└── README.md
-```
-
-## Phase 2 — Obsidian plugin
-
-Plugin source: [`../obsidian-plugin`](../obsidian-plugin)
-
-Installed into vault as:
-
-```text
-<vault>/.obsidian/plugins/cursor-sidecar/
-```
-
-Ribbon icon runs:
-
-```text
-python main.py --workspace <vault> click
-```
-
-Extra CLI commands:
-
-```powershell
-python main.py dock                 # launch + arrange once (no follow)
-python main.py click                # dock if down, toggle if up
-python main.py start --no-follow
-python main.py --workspace "D:\vault" dock
+python main.py attach          # save originals + arrange
+python main.py detach          # restore WindowPlacement
+python main.py click           # attach ↔ detach
+python main.py arrange         # re-split bound windows
+python main.py focus           # focus bound Cursor HWND
+python main.py toggle          # show/hide (advanced)
+python main.py show
+python main.py hide
 python main.py status --json
 ```
 
-## Phase 3 — Context (optional)
+Aliases: `dock`→`attach`, `undock`/`restore`→`detach`.
 
-- “Open current note in Cursor”
-- Path sync / cursor position (harder; still external)
+## State (`.sidecar.state.json`)
 
-## Explicitly out of scope
+On Attach (only when previously detached):
 
-- Modifying Cursor / Electron
-- Injection, hooks, overlays into Cursor
-- Cursor CLI / ACP / API as the editor surface
-- Fake “embedded” iframe of Cursor
+- `attached: true`
+- Obsidian / Cursor: `hwnd`, `pid`, `original_rect`, `original_window_placement`, `original_monitor`, visibility
+- Bound HWNDs for subsequent ops
+- Current `left_rect` / `right_rect`
 
-## Troubleshooting
+On Detach: restore via `SetWindowPlacement`, then `attached: false`.
 
-| Symptom | Check |
-|---------|--------|
-| `Obsidian window not found` | Open a vault; run `status`; adjust `obsidian_title_hint` |
-| `Cursor window not found` | Open Editor window (not only tray); adjust `cursor_title_hint` |
-| Wrong monitor | Set `"monitor": null` or the correct index from multi-monitor setup |
-| Layout fights maximize | Sidecar restores maximized windows before resizing — avoid leaving Obsidian maximized if you want stable split |
-| Follow loop won’t stop | `python main.py stop` or end the `python main.py start` terminal with Ctrl+C |
+Stale HWND/PID → `status` reports `attached=false`, `state_valid=false`.
+
+## DPI
+
+Startup calls `enable_dpi_awareness()`:
+
+1. `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`
+2. else `SetProcessDpiAwareness(2)`
+3. else `SetProcessDPIAware()`
+
+Work area comes from `MonitorFromWindow(obsidian) → GetMonitorInfo`, not monitor-index round-trips (unless config forces an index).
+
+## Multi-Cursor
+
+After Attach, operations use the **bound** Cursor HWND+PID. Rediscovery only if that window dies.
+
+## Install
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pytest
+python -m py_compile main.py window.py geometry.py
+```
+
+Obsidian plugin: copy `obsidian-plugin/*` → `<vault>/.obsidian/plugins/cursor-sidecar/`, set **Sidecar directory** in plugin settings.
+
+## Out of scope for v0.2
+
+Daemon follow / WinEventHook, note sync, PyInstaller, SetParent, Cursor CLI — those are v0.3+.
+
+## Roadmap
+
+```text
+v0.2  Attach/Detach + restore + DPI + HWND bind   ← you are here
+v0.3  Daemon + live follow + multi-monitor polish
+v0.4  Open current note / focus / context
+v1.0  sidecar.exe, zero Python for end users
+```

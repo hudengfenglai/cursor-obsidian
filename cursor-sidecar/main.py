@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Cursor Sidecar — dock real Cursor Desktop beside Obsidian (Windows).
-
-Commands:
-  python main.py start     Launch Cursor if needed, arrange, optionally follow
-  python main.py arrange   One-shot split layout
-  python main.py stop      Stop follow loop (if running) / no-op for windows
-  python main.py toggle    Show/hide Cursor window
-  python main.py status    Print discovered windows
-"""
+"""Cursor Sidecar v0.2 — Attach/Detach lifecycle for real Cursor Desktop."""
 
 from __future__ import annotations
 
@@ -15,27 +7,40 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+from geometry import evaluate_attachment, normalize_ratios
 from window import (
-    arrange_sidecar,
+    apply_window_placement,
+    arrange_bound_windows,
+    enable_dpi_awareness,
     find_cursor_window,
     find_obsidian_window,
-    get_window_rect,
+    focus_window,
     is_process_running,
+    is_same_window,
     launch_process,
+    resolve_bound_window,
     resolve_cursor_exe,
+    snapshot_window,
     toggle_cursor_visibility,
     wait_for_window,
+    window_info_from_hwnd,
 )
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
 PID_FILE = ROOT / ".sidecar.pid"
+DAEMON_PID_FILE = ROOT / ".sidecar.daemon.pid"
 STATE_FILE = ROOT / ".sidecar.state.json"
+
+VERSION = "0.2.0"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -43,65 +48,112 @@ def load_config(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"config not found: {path}")
     with path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
-    # Normalize ratios if only one provided.
-    o = float(cfg.get("obsidian_ratio", 0.7))
-    c = float(cfg.get("cursor_ratio", 0.3))
-    if o <= 0 or c <= 0:
-        raise ValueError("obsidian_ratio and cursor_ratio must be > 0")
+    o, c = normalize_ratios(cfg.get("obsidian_ratio", 0.7), cfg.get("cursor_ratio", 0.3))
     cfg["obsidian_ratio"] = o
     cfg["cursor_ratio"] = c
     cfg["gap"] = int(cfg.get("gap", 0))
-    cfg["monitor"] = cfg.get("monitor", 0)
+    cfg["monitor"] = cfg.get("monitor", None)
     cfg["poll_ms"] = int(cfg.get("poll_ms", 500))
-    cfg["follow_obsidian"] = bool(cfg.get("follow_obsidian", True))
+    cfg["follow_obsidian"] = bool(cfg.get("follow_obsidian", False))
     cfg["launch_cursor_if_missing"] = bool(cfg.get("launch_cursor_if_missing", True))
+    cfg["daemon_host"] = str(cfg.get("daemon_host", "127.0.0.1"))
+    cfg["daemon_port"] = int(cfg.get("daemon_port", 27845))
     return cfg
 
 
+def read_state() -> dict[str, Any]:
+    if not STATE_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def write_state(data: dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    STATE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def read_pid() -> int | None:
-    if not PID_FILE.is_file():
+def clear_attached_state(keep_file: bool = True) -> None:
+    if not keep_file:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+        return
+    state = read_state()
+    state["attached"] = False
+    state["timestamp"] = time.time()
+    # Keep originals for debugging but mark detached
+    write_state(state)
+
+
+def read_pid(path: Path = PID_FILE) -> int | None:
+    if not path.is_file():
         return None
     try:
-        return int(PID_FILE.read_text(encoding="utf-8").strip())
+        return int(path.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
 
 
-def write_pid(pid: int) -> None:
-    PID_FILE.write_text(str(pid), encoding="utf-8")
+def write_pid(pid: int, path: Path = PID_FILE) -> None:
+    path.write_text(str(pid), encoding="utf-8")
 
 
-def clear_pid() -> None:
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+def clear_pid(path: Path = PID_FILE) -> None:
+    if path.exists():
+        path.unlink()
 
 
-def ensure_cursor(cfg: dict[str, Any], workspace: str | None = None) -> None:
+def binding_live(record: dict[str, Any] | None) -> bool:
+    if not record:
+        return False
+    return is_same_window(int(record.get("hwnd") or 0), int(record.get("pid") or 0))
+
+
+def refresh_attachment_truth(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Recompute attached/state_valid; persist correction if stale."""
+    state = dict(state if state is not None else read_state())
+    obs = state.get("obsidian") or {}
+    cur = state.get("cursor") or {}
+    verdict = evaluate_attachment(
+        state,
+        obsidian_live=binding_live(obs),
+        cursor_live=binding_live(cur),
+    )
+    if state.get("attached") and not verdict["attached"]:
+        state["attached"] = False
+        state["stale_reason"] = verdict["reason"]
+        state["timestamp"] = time.time()
+        write_state(state)
+    return {**verdict, "state": state}
+
+
+def ensure_cursor(
+    cfg: dict[str, Any],
+    workspace: str | None = None,
+    file_path: str | None = None,
+) -> None:
     proc = cfg["cursor_process"]
+    exe = resolve_cursor_exe(cfg.get("cursor_exe_candidates", []))
+    args: list[str] = []
+    if file_path:
+        args.append(file_path)
+    elif workspace:
+        args.append(workspace)
+
     if is_process_running(proc):
-        # Already running — optionally open folder in existing instance.
-        if workspace:
-            exe = resolve_cursor_exe(cfg.get("cursor_exe_candidates", []))
-            if exe:
-                print(f"[sidecar] opening workspace in Cursor: {workspace}")
-                launch_process(exe, args=[workspace])
+        if args and exe:
+            print(f"[sidecar] opening in Cursor: {' '.join(args)}")
+            launch_process(exe, args=args)
         return
+
     if not cfg["launch_cursor_if_missing"]:
         raise RuntimeError(f"{proc} is not running and launch_cursor_if_missing=false")
-
-    exe = resolve_cursor_exe(cfg.get("cursor_exe_candidates", []))
     if not exe:
-        raise RuntimeError(
-            "Cursor.exe not found. Add path to config.cursor_exe_candidates"
-        )
-    args = [workspace] if workspace else None
-    print(f"[sidecar] launching {exe}" + (f" {workspace}" if workspace else ""))
-    launch_process(exe, args=args)
-
+        raise RuntimeError("Cursor.exe not found. Add path to config.cursor_exe_candidates")
+    print(f"[sidecar] launching {exe}" + (f" {' '.join(args)}" if args else ""))
+    launch_process(exe, args=args or None)
     found = wait_for_window(
         lambda: find_cursor_window(proc, cfg.get("cursor_title_hint", "")),
         timeout_s=45.0,
@@ -110,85 +162,21 @@ def ensure_cursor(cfg: dict[str, Any], workspace: str | None = None) -> None:
         raise RuntimeError("Cursor launched but window not found in time")
 
 
-def do_arrange(cfg: dict[str, Any]) -> None:
+def _monitor_arg(cfg: dict[str, Any]) -> int | None:
     monitor = cfg.get("monitor")
-    # monitor: 0 = primary index; null/"auto" = follow Obsidian's monitor
     if monitor in (None, "auto"):
-        mon: int | None = None
-    else:
-        mon = int(monitor)
-
-    obsidian, cursor, left, right = arrange_sidecar(
-        obsidian_process=cfg["obsidian_process"],
-        cursor_process=cfg["cursor_process"],
-        obsidian_title_hint=cfg.get("obsidian_title_hint", ""),
-        cursor_title_hint=cfg.get("cursor_title_hint", ""),
-        obsidian_ratio=cfg["obsidian_ratio"],
-        cursor_ratio=cfg["cursor_ratio"],
-        gap=cfg["gap"],
-        monitor=mon,
-    )
-    print(
-        f"[sidecar] arranged\n"
-        f"  Obsidian hwnd={obsidian.hwnd} {obsidian.rect.as_tuple()}  \"{obsidian.title}\"\n"
-        f"  Cursor   hwnd={cursor.hwnd} {cursor.rect.as_tuple()}  \"{cursor.title}\"\n"
-        f"  target L={left.as_tuple()} R={right.as_tuple()}"
-    )
-    write_state(
-        {
-            "obsidian_hwnd": obsidian.hwnd,
-            "cursor_hwnd": cursor.hwnd,
-            "left": list(left.as_tuple()),
-            "right": list(right.as_tuple()),
-            "updated_at": time.time(),
-        }
-    )
+        return None
+    return int(monitor)
 
 
-def follow_loop(cfg: dict[str, Any]) -> None:
-    """Re-arrange when Obsidian moves / resizes (e.g. after maximize then restore)."""
-    poll = max(cfg["poll_ms"], 100) / 1000.0
-    last_rect: tuple[int, int, int, int] | None = None
-    print(f"[sidecar] follow mode on (poll={cfg['poll_ms']}ms). Ctrl+C to stop.")
-    write_pid(os.getpid())
+def cmd_attach(
+    cfg: dict[str, Any],
+    workspace: str | None = None,
+    file_path: str | None = None,
+) -> int:
+    """Attach Sidecar: save originals once, bind HWNDs, arrange 70/30. Idempotent."""
+    ensure_cursor(cfg, workspace=workspace, file_path=file_path)
 
-    def _stop(_sig: int, _frame: object) -> None:
-        print("\n[sidecar] stopping follow loop")
-        clear_pid()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
-
-    while True:
-        obsidian = find_obsidian_window(
-            cfg["obsidian_process"], cfg.get("obsidian_title_hint", "")
-        )
-        if not obsidian:
-            time.sleep(poll)
-            continue
-        rect = get_window_rect(obsidian.hwnd).as_tuple()
-        if last_rect is None or rect != last_rect:
-            try:
-                do_arrange(cfg)
-                # After arrange, Obsidian rect changes — update baseline.
-                obsidian2 = find_obsidian_window(
-                    cfg["obsidian_process"], cfg.get("obsidian_title_hint", "")
-                )
-                last_rect = (
-                    get_window_rect(obsidian2.hwnd).as_tuple()
-                    if obsidian2
-                    else rect
-                )
-            except RuntimeError as exc:
-                print(f"[sidecar] arrange skipped: {exc}")
-                last_rect = rect
-        time.sleep(poll)
-
-
-def cmd_start(cfg: dict[str, Any], workspace: str | None = None, follow: bool | None = None) -> int:
-    ensure_cursor(cfg, workspace=workspace)
-    # Wait for Obsidian too.
     obs = wait_for_window(
         lambda: find_obsidian_window(
             cfg["obsidian_process"], cfg.get("obsidian_title_hint", "")
@@ -196,177 +184,585 @@ def cmd_start(cfg: dict[str, Any], workspace: str | None = None, follow: bool | 
         timeout_s=5.0,
     )
     if not obs:
-        print(
-            "[sidecar] warning: Obsidian window not found yet. "
-            "Open Obsidian, then run: python main.py arrange"
+        print("[sidecar] Obsidian window not found")
+        return 1
+
+    truth = refresh_attachment_truth()
+    state = truth["state"]
+
+    # Reuse bound windows when still attached & valid
+    if truth["attached"]:
+        obs_b = resolve_bound_window(
+            state.get("obsidian"),
+            cfg["obsidian_process"],
+            cfg.get("obsidian_title_hint", ""),
         )
-        return 1
-
-    do_arrange(cfg)
-    do_follow = cfg.get("follow_obsidian", True) if follow is None else follow
-    if do_follow:
-        follow_loop(cfg)
-    return 0
-
-
-def cmd_dock(cfg: dict[str, Any], workspace: str | None = None) -> int:
-    """Launch Cursor if needed, arrange once — no follow loop (plugin-friendly)."""
-    return cmd_start(cfg, workspace=workspace, follow=False)
-
-
-def cmd_click(cfg: dict[str, Any], workspace: str | None = None) -> int:
-    """Ribbon semantics: dock if Cursor down; toggle visibility if up."""
-    proc = cfg["cursor_process"]
-    if is_process_running(proc):
-        # Prefer toggle when a window already exists (visible or hidden).
-        try:
-            return cmd_toggle(cfg)
-        except RuntimeError:
-            # Process up but window not ready — wait and dock.
-            wait_for_window(
-                lambda: find_cursor_window(proc, cfg.get("cursor_title_hint", "")),
-                timeout_s=20.0,
+        cur_b = resolve_bound_window(
+            state.get("cursor"),
+            cfg["cursor_process"],
+            cfg.get("cursor_title_hint", ""),
+            allow_hidden=True,
+        )
+        if obs_b and cur_b:
+            left, right = arrange_bound_windows(
+                obs_b,
+                cur_b,
+                obsidian_ratio=cfg["obsidian_ratio"],
+                cursor_ratio=cfg["cursor_ratio"],
+                gap=cfg["gap"],
+                monitor=_monitor_arg(cfg),
             )
-            return cmd_dock(cfg, workspace=workspace)
-    return cmd_dock(cfg, workspace=workspace)
+            state["left_rect"] = list(left.as_tuple())
+            state["right_rect"] = list(right.as_tuple())
+            state["attached"] = True
+            state["timestamp"] = time.time()
+            write_state(state)
+            print("[sidecar] attach (idempotent rearrange)")
+            return 0
 
-
-def cmd_arrange(cfg: dict[str, Any], workspace: str | None = None) -> int:
-    del workspace  # unused
-    do_arrange(cfg)
-    return 0
-
-
-def cmd_stop(cfg: dict[str, Any], workspace: str | None = None) -> int:
-    del cfg, workspace
-    pid = read_pid()
-    if not pid:
-        print("[sidecar] no follow loop pid file")
-        return 0
-    try:
-        os.kill(pid, signal.SIGTERM)
-        print(f"[sidecar] sent SIGTERM to pid {pid}")
-    except OSError as exc:
-        print(f"[sidecar] could not stop pid {pid}: {exc}")
-        clear_pid()
+    # Fresh attach — discover Cursor (prefer existing binding only if live)
+    cur = resolve_bound_window(
+        state.get("cursor") if binding_live(state.get("cursor")) else None,
+        cfg["cursor_process"],
+        cfg.get("cursor_title_hint", ""),
+        allow_hidden=True,
+    )
+    if not cur:
+        cur = find_cursor_window(cfg["cursor_process"], cfg.get("cursor_title_hint", ""))
+    if not cur:
+        print("[sidecar] Cursor window not found")
         return 1
-    clear_pid()
+
+    # Capture ORIGINAL layout only when transitioning into attached
+    obs_snap = snapshot_window(obs.hwnd)
+    cur_snap = snapshot_window(cur.hwnd)
+    obs_snap["process"] = cfg["obsidian_process"]
+    cur_snap["process"] = cfg["cursor_process"]
+
+    left, right = arrange_bound_windows(
+        obs,
+        cur,
+        obsidian_ratio=cfg["obsidian_ratio"],
+        cursor_ratio=cfg["cursor_ratio"],
+        gap=cfg["gap"],
+        monitor=_monitor_arg(cfg),
+    )
+
+    new_state = {
+        "attached": True,
+        "timestamp": time.time(),
+        "version": VERSION,
+        "obsidian": obs_snap,
+        "cursor": cur_snap,
+        "left_rect": list(left.as_tuple()),
+        "right_rect": list(right.as_tuple()),
+        "bound": {
+            "obsidian_hwnd": obs.hwnd,
+            "obsidian_pid": obs.pid,
+            "cursor_hwnd": cur.hwnd,
+            "cursor_pid": cur.pid,
+        },
+    }
+    write_state(new_state)
+    print(
+        f"[sidecar] attached\n"
+        f"  Obsidian hwnd={obs.hwnd} pid={obs.pid}\n"
+        f"  Cursor   hwnd={cur.hwnd} pid={cur.pid}\n"
+        f"  L={left.as_tuple()} R={right.as_tuple()}"
+    )
     return 0
 
 
-def cmd_toggle(cfg: dict[str, Any], workspace: str | None = None) -> int:
-    del workspace
+def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
+    """Detach Sidecar and restore original WindowPlacement for both apps."""
+    truth = refresh_attachment_truth()
+    state = truth["state"]
+    if not state.get("obsidian") and not state.get("cursor"):
+        print("[sidecar] no saved state; already detached")
+        write_state({"attached": False, "timestamp": time.time(), "version": VERSION})
+        return 0
+
+    # Stop follow if any (v0.3 will own daemon lifecycle)
+    follow = read_pid(PID_FILE)
+    if follow:
+        try:
+            os.kill(follow, signal.SIGTERM)
+        except OSError:
+            pass
+        clear_pid(PID_FILE)
+
+    obs_snap = state.get("obsidian") or {}
+    cur_snap = state.get("cursor") or {}
+
+    def _restore(snap: dict[str, Any], process_name: str, label: str) -> str:
+        if not snap:
+            return "skip"
+        hwnd = int(snap.get("hwnd") or 0)
+        pid = int(snap.get("pid") or 0)
+        if not is_same_window(hwnd, pid):
+            # Soft rediscovery by process — still try placement if we find a window
+            found = resolve_bound_window(None, process_name, allow_hidden=True)
+            if not found:
+                return "gone"
+            hwnd = found.hwnd
+        ok = apply_window_placement(hwnd, snap)
+        return "ok" if ok else "fail"
+
+    r_obs = _restore(obs_snap, cfg["obsidian_process"], "obsidian")
+    r_cur = _restore(cur_snap, cfg["cursor_process"], "cursor")
+
+    write_state(
+        {
+            "attached": False,
+            "timestamp": time.time(),
+            "version": VERSION,
+            "last_detach": {
+                "obsidian": r_obs,
+                "cursor": r_cur,
+            },
+            # Keep last originals for debugging; not active
+            "obsidian": obs_snap,
+            "cursor": cur_snap,
+        }
+    )
+    print(f"[sidecar] detached (obsidian={r_obs}, cursor={r_cur})")
+    return 0
+
+
+def cmd_click(
+    cfg: dict[str, Any],
+    workspace: str | None = None,
+    file_path: str | None = None,
+) -> int:
+    """Ribbon: Attach if detached, Detach if attached. NOT show/hide."""
+    truth = refresh_attachment_truth()
+    if truth["attached"]:
+        return cmd_detach(cfg)
+    return cmd_attach(cfg, workspace=workspace, file_path=file_path)
+
+
+def cmd_arrange(cfg: dict[str, Any], **_: Any) -> int:
+    """Re-arrange while keeping originals; attaches if needed."""
+    truth = refresh_attachment_truth()
+    if not truth["attached"]:
+        return cmd_attach(cfg)
+    state = truth["state"]
+    obs = resolve_bound_window(
+        state.get("obsidian"),
+        cfg["obsidian_process"],
+        cfg.get("obsidian_title_hint", ""),
+    )
+    cur = resolve_bound_window(
+        state.get("cursor"),
+        cfg["cursor_process"],
+        cfg.get("cursor_title_hint", ""),
+        allow_hidden=True,
+    )
+    if not obs or not cur:
+        return cmd_attach(cfg)
+    left, right = arrange_bound_windows(
+        obs,
+        cur,
+        obsidian_ratio=cfg["obsidian_ratio"],
+        cursor_ratio=cfg["cursor_ratio"],
+        gap=cfg["gap"],
+        monitor=_monitor_arg(cfg),
+    )
+    state["left_rect"] = list(left.as_tuple())
+    state["right_rect"] = list(right.as_tuple())
+    state["timestamp"] = time.time()
+    write_state(state)
+    print(f"[sidecar] arranged L={left.as_tuple()} R={right.as_tuple()}")
+    return 0
+
+
+def cmd_focus(cfg: dict[str, Any], **_: Any) -> int:
+    truth = refresh_attachment_truth()
+    state = truth["state"]
+    cur = resolve_bound_window(
+        state.get("cursor") if truth["attached"] else None,
+        cfg["cursor_process"],
+        cfg.get("cursor_title_hint", ""),
+        allow_hidden=True,
+    )
+    if not cur:
+        print("[sidecar] Cursor window not found")
+        return 1
+    focus_window(cur.hwnd)
+    print(f"[sidecar] focused Cursor hwnd={cur.hwnd}")
+    return 0
+
+
+def cmd_toggle(cfg: dict[str, Any], **_: Any) -> int:
+    truth = refresh_attachment_truth()
+    binding = (truth["state"].get("cursor") if truth["attached"] else None)
     state = toggle_cursor_visibility(
-        cfg["cursor_process"], cfg.get("cursor_title_hint", "")
+        cfg["cursor_process"],
+        cfg.get("cursor_title_hint", ""),
+        binding=binding,
     )
     print(f"[sidecar] Cursor {state}")
     return 0
 
 
-def cmd_status(cfg: dict[str, Any], workspace: str | None = None, as_json: bool = False) -> int:
-    del workspace
-    obs = find_obsidian_window(
-        cfg["obsidian_process"], cfg.get("obsidian_title_hint", "")
+def cmd_show(cfg: dict[str, Any], **_: Any) -> int:
+    truth = refresh_attachment_truth()
+    cur = resolve_bound_window(
+        truth["state"].get("cursor") if truth["attached"] else None,
+        cfg["cursor_process"],
+        cfg.get("cursor_title_hint", ""),
+        allow_hidden=True,
     )
-    cur = find_cursor_window(
-        cfg["cursor_process"], cfg.get("cursor_title_hint", "")
+    if not cur:
+        print("[sidecar] Cursor window not found")
+        return 1
+    focus_window(cur.hwnd)
+    print("[sidecar] Cursor shown")
+    return 0
+
+
+def cmd_hide(cfg: dict[str, Any], **_: Any) -> int:
+    truth = refresh_attachment_truth()
+    cur = resolve_bound_window(
+        truth["state"].get("cursor") if truth["attached"] else None,
+        cfg["cursor_process"],
+        cfg.get("cursor_title_hint", ""),
+        allow_hidden=True,
     )
-    payload = {
-        "obsidian": None
-        if not obs
-        else {
-            "hwnd": obs.hwnd,
-            "pid": obs.pid,
-            "title": obs.title,
-            "rect": list(obs.rect.as_tuple()),
-        },
-        "cursor": None
-        if not cur
-        else {
-            "hwnd": cur.hwnd,
-            "pid": cur.pid,
-            "title": cur.title,
-            "rect": list(cur.rect.as_tuple()),
-            "visible": bool(__import__("win32gui").IsWindowVisible(cur.hwnd)),
-        },
+    if not cur:
+        print("[sidecar] Cursor window not found")
+        return 1
+    from window import hide_window
+
+    hide_window(cur.hwnd)
+    print("[sidecar] Cursor hidden")
+    return 0
+
+
+def cmd_open(
+    cfg: dict[str, Any],
+    workspace: str | None = None,
+    file_path: str | None = None,
+) -> int:
+    if not file_path and not workspace:
+        print("[sidecar] open requires --file or --workspace")
+        return 1
+    ensure_cursor(cfg, workspace=workspace, file_path=file_path)
+    print(f"[sidecar] opened {file_path or workspace}")
+    return 0
+
+
+def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
+    truth = refresh_attachment_truth()
+    state = truth["state"]
+    obs_live = binding_live(state.get("obsidian"))
+    cur_live = binding_live(state.get("cursor"))
+
+    obs_info = None
+    if obs_live:
+        info = window_info_from_hwnd(int(state["obsidian"]["hwnd"]))
+        if info:
+            obs_info = {
+                "hwnd": info.hwnd,
+                "pid": info.pid,
+                "title": info.title,
+                "rect": list(info.rect.as_tuple()),
+                "bound": True,
+            }
+    if obs_info is None:
+        found = find_obsidian_window(
+            cfg["obsidian_process"], cfg.get("obsidian_title_hint", "")
+        )
+        if found:
+            obs_info = {
+                "hwnd": found.hwnd,
+                "pid": found.pid,
+                "title": found.title,
+                "rect": list(found.rect.as_tuple()),
+                "bound": False,
+            }
+
+    cur_info = None
+    if cur_live:
+        info = window_info_from_hwnd(int(state["cursor"]["hwnd"]))
+        if info:
+            cur_info = {
+                "hwnd": info.hwnd,
+                "pid": info.pid,
+                "title": info.title,
+                "rect": list(info.rect.as_tuple()),
+                "bound": True,
+                "visible": bool(__import__("win32gui").IsWindowVisible(info.hwnd)),
+            }
+    if cur_info is None:
+        found = find_cursor_window(
+            cfg["cursor_process"], cfg.get("cursor_title_hint", "")
+        )
+        if found:
+            cur_info = {
+                "hwnd": found.hwnd,
+                "pid": found.pid,
+                "title": found.title,
+                "rect": list(found.rect.as_tuple()),
+                "bound": False,
+                "visible": bool(__import__("win32gui").IsWindowVisible(found.hwnd)),
+            }
+
+    return {
+        "version": VERSION,
+        "attached": truth["attached"],
+        "state_valid": truth["state_valid"],
+        "reason": truth["reason"],
+        "obsidian": obs_info,
+        "cursor": cur_info,
         "cursor_running": is_process_running(cfg["cursor_process"]),
-        "follow_pid": read_pid(),
+        "follow_pid": read_pid(PID_FILE),
+        "daemon_pid": read_pid(DAEMON_PID_FILE),
+        "left_rect": state.get("left_rect"),
+        "right_rect": state.get("right_rect"),
     }
+
+
+def cmd_status(cfg: dict[str, Any], as_json: bool = False, **_: Any) -> int:
+    payload = build_status(cfg)
     if as_json:
         print(json.dumps(payload, ensure_ascii=False))
         return 0
     print("[sidecar] status")
-    if obs:
-        print(f"  Obsidian: hwnd={obs.hwnd} pid={obs.pid} {obs.rect.as_tuple()} \"{obs.title}\"")
+    print(f"  attached: {payload['attached']}  state_valid: {payload['state_valid']}  ({payload['reason']})")
+    if payload["obsidian"]:
+        o = payload["obsidian"]
+        print(f"  Obsidian: hwnd={o['hwnd']} pid={o['pid']} bound={o['bound']} \"{o['title']}\"")
     else:
         print("  Obsidian: not found")
-    if cur:
-        print(f"  Cursor:   hwnd={cur.hwnd} pid={cur.pid} {cur.rect.as_tuple()} \"{cur.title}\"")
+    if payload["cursor"]:
+        c = payload["cursor"]
+        print(f"  Cursor:   hwnd={c['hwnd']} pid={c['pid']} bound={c.get('bound')} \"{c['title']}\"")
     else:
         print("  Cursor:   not found")
-    print(f"  cursor running: {payload['cursor_running']}")
-    print(f"  follow pid: {payload['follow_pid'] or 'none'}")
+    print(f"  cursor_running: {payload['cursor_running']}")
+    print(f"  follow_pid: {payload['follow_pid'] or 'none'}")
+    print(f"  daemon_pid: {payload['daemon_pid'] or 'none'}")
+    return 0
+
+
+def cmd_stop(cfg: dict[str, Any], **_: Any) -> int:
+    del cfg
+    stopped = False
+    for label, path in (("daemon", DAEMON_PID_FILE), ("follow", PID_FILE)):
+        pid = read_pid(path)
+        if not pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"[sidecar] stopped {label} pid={pid}")
+            stopped = True
+        except OSError as exc:
+            print(f"[sidecar] could not stop {label}: {exc}")
+        clear_pid(path)
+    if not stopped:
+        print("[sidecar] nothing to stop")
+    return 0
+
+
+# ---- Optional thin daemon (kept for plugin; lifecycle is attach/detach) ----
+
+def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    cmd = str(body.get("cmd") or body.get("command") or "").strip().lower()
+    # Aliases from older plugin
+    aliases = {"dock": "attach", "undock": "detach", "restore": "detach"}
+    cmd = aliases.get(cmd, cmd)
+    workspace = body.get("workspace")
+    file_path = body.get("file") or body.get("file_path")
+    try:
+        if cmd == "attach":
+            code = cmd_attach(cfg, workspace=workspace, file_path=file_path)
+        elif cmd == "detach":
+            code = cmd_detach(cfg)
+        elif cmd == "click":
+            code = cmd_click(cfg, workspace=workspace, file_path=file_path)
+        elif cmd == "arrange":
+            code = cmd_arrange(cfg)
+        elif cmd == "toggle":
+            code = cmd_toggle(cfg)
+        elif cmd == "show":
+            code = cmd_show(cfg)
+        elif cmd == "hide":
+            code = cmd_hide(cfg)
+        elif cmd == "focus":
+            code = cmd_focus(cfg)
+        elif cmd == "open":
+            code = cmd_open(cfg, workspace=workspace, file_path=file_path)
+        elif cmd == "status":
+            return {"ok": True, "cmd": cmd, "status": build_status(cfg)}
+        else:
+            return {"ok": False, "error": f"unknown cmd: {cmd}"}
+        truth = refresh_attachment_truth()
+        return {
+            "ok": code == 0,
+            "cmd": cmd,
+            "code": code,
+            "attached": truth["attached"],
+            "state_valid": truth["state_valid"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "cmd": cmd, "error": str(exc)}
+
+
+def run_daemon(cfg: dict[str, Any]) -> int:
+    host, port = cfg["daemon_host"], cfg["daemon_port"]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            print(f"[daemon] {fmt % args}")
+
+        def _send(self, code: int, payload: dict[str, Any]) -> None:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if path in ("/", "/health"):
+                self._send(200, {"ok": True, "service": "cursor-sidecar", "version": VERSION})
+                return
+            if path == "/status":
+                self._send(200, {"ok": True, "status": build_status(cfg)})
+                return
+            self._send(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self) -> None:  # noqa: N802
+            if urlparse(self.path).path not in ("/rpc", "/"):
+                self._send(404, {"ok": False, "error": "not found"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._send(400, {"ok": False, "error": "invalid json"})
+                return
+            result = handle_rpc(cfg, body if isinstance(body, dict) else {})
+            self._send(200 if result.get("ok") else 500, result)
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    write_pid(os.getpid(), DAEMON_PID_FILE)
+    print(f"[sidecar] daemon http://{host}:{port}")
+
+    def _stop(_sig: int, _frame: object) -> None:
+        clear_pid(DAEMON_PID_FILE)
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        server.serve_forever()
+    finally:
+        clear_pid(DAEMON_PID_FILE)
+    return 0
+
+
+def cmd_daemon(cfg: dict[str, Any], **_: Any) -> int:
+    return run_daemon(cfg)
+
+
+def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
+    existing = read_pid(DAEMON_PID_FILE)
+    if existing:
+        try:
+            os.kill(existing, 0)
+            print(f"[sidecar] daemon already running pid={existing}")
+            return 0
+        except OSError:
+            clear_pid(DAEMON_PID_FILE)
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+    subprocess.Popen(
+        [sys.executable, str(ROOT / "main.py"), "-c", str(DEFAULT_CONFIG), "daemon"],
+        cwd=str(ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+    time.sleep(0.5)
+    print(f"[sidecar] daemon-start port={cfg['daemon_port']}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="cursor-sidecar",
-        description="Dock Cursor Desktop beside Obsidian without modifying either app.",
-    )
-    p.add_argument(
-        "-c",
-        "--config",
-        default=str(DEFAULT_CONFIG),
-        help="path to config.json",
-    )
-    p.add_argument(
-        "--workspace",
-        default=None,
-        help="folder to open in Cursor (usually the Obsidian vault path)",
-    )
+    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.2 lifecycle")
+    p.add_argument("-c", "--config", default=str(DEFAULT_CONFIG))
+    p.add_argument("--workspace", default=None)
+    p.add_argument("--file", default=None)
     sub = p.add_subparsers(dest="command", required=True)
 
-    start_p = sub.add_parser("start", help="ensure Cursor, arrange, optionally follow Obsidian")
-    start_p.add_argument(
-        "--no-follow",
-        action="store_true",
-        help="arrange once without follow loop",
-    )
-    sub.add_parser("dock", help="launch Cursor if needed + arrange once (no follow)")
-    sub.add_parser(
-        "click",
-        help="Obsidian ribbon action: dock if Cursor down, else show/hide",
-    )
-    sub.add_parser("arrange", help="one-shot 70/30 (configurable) split")
-    sub.add_parser("stop", help="stop follow loop started by start")
-    sub.add_parser("toggle", help="show/hide Cursor window")
-    status_p = sub.add_parser("status", help="print window discovery info")
-    status_p.add_argument("--json", action="store_true", help="machine-readable JSON")
+    sub.add_parser("attach", help="Attach Sidecar (save originals + arrange)")
+    sub.add_parser("detach", help="Detach and restore original window placements")
+    sub.add_parser("click", help="Attach if detached, Detach if attached")
+    sub.add_parser("arrange", help="Re-arrange bound windows")
+    sub.add_parser("focus", help="Focus bound Cursor window")
+    sub.add_parser("toggle", help="Show/hide Cursor (advanced)")
+    sub.add_parser("show", help="Show Cursor")
+    sub.add_parser("hide", help="Hide Cursor")
+    sub.add_parser("open", help="Open --file/--workspace in Cursor Desktop")
+    status_p = sub.add_parser("status", help="Attachment + window status")
+    status_p.add_argument("--json", action="store_true")
+    sub.add_parser("stop", help="Stop follow/daemon pids")
+    sub.add_parser("daemon", help="Foreground HTTP helper (optional)")
+    sub.add_parser("daemon-start", help="Background HTTP helper (optional)")
+
+    # Back-compat aliases
+    sub.add_parser("dock", help="alias of attach")
+    sub.add_parser("undock", help="alias of detach")
+    sub.add_parser("restore", help="alias of detach")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    dpi = enable_dpi_awareness()
     parser = build_parser()
     args = parser.parse_args(argv)
     cfg = load_config(Path(args.config))
-    workspace = args.workspace
+    common = {"workspace": args.workspace, "file_path": args.file}
 
-    if args.command == "start":
-        return cmd_start(cfg, workspace=workspace, follow=not args.no_follow)
-    if args.command == "dock":
-        return cmd_dock(cfg, workspace=workspace)
-    if args.command == "click":
-        return cmd_click(cfg, workspace=workspace)
-    if args.command == "arrange":
-        return cmd_arrange(cfg, workspace=workspace)
-    if args.command == "stop":
-        return cmd_stop(cfg, workspace=workspace)
-    if args.command == "toggle":
-        return cmd_toggle(cfg, workspace=workspace)
-    if args.command == "status":
-        return cmd_status(cfg, workspace=workspace, as_json=bool(args.json))
-    parser.error(f"unknown command: {args.command}")
+    aliases = {"dock": "attach", "undock": "detach", "restore": "detach"}
+    command = aliases.get(args.command, args.command)
+
+    if command != "status":
+        print(f"[sidecar] dpi={dpi}")
+
+    dispatch = {
+        "attach": cmd_attach,
+        "detach": cmd_detach,
+        "click": cmd_click,
+        "arrange": cmd_arrange,
+        "focus": cmd_focus,
+        "toggle": cmd_toggle,
+        "show": cmd_show,
+        "hide": cmd_hide,
+        "open": cmd_open,
+        "stop": cmd_stop,
+        "daemon": cmd_daemon,
+        "daemon-start": cmd_daemon_start,
+    }
+    if command == "status":
+        return cmd_status(cfg, as_json=bool(args.json), **common)
+    if command in dispatch:
+        return dispatch[command](cfg, **common)
+    parser.error(f"unknown command: {command}")
     return 2
 
 

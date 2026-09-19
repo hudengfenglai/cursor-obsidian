@@ -2,7 +2,7 @@ cursor-sidecar/.venv/
 cursor-sidecar/__pycache__/
 cursor-sidecar/*.pyc
 cursor-sidecar/.sidecar.pid
+cursor-sidecar/.sidecar.daemon.pid
 cursor-sidecar/.sidecar.state.json
-cursor-sidecar/_install_gh.ps1
 .DS_Store
 Thumbs.db

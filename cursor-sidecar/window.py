@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import psutil
 import win32api
@@ -15,8 +15,46 @@ import win32con
 import win32gui
 import win32process
 
+from geometry import compute_split_rects as _compute_split_rects_pure
+from geometry import placement_dict, placement_tuple
 
 user32 = ctypes.windll.user32
+_DPI_READY = False
+
+# DPI awareness context: DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+
+
+def enable_dpi_awareness() -> str:
+    """Enable Per-Monitor DPI Awareness V2 before any coordinate Win32 calls."""
+    global _DPI_READY
+    if _DPI_READY:
+        return "already"
+
+    # Prefer V2 context (Win10 1703+)
+    try:
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            ok = user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            if ok:
+                _DPI_READY = True
+                return "per_monitor_v2"
+    except Exception:
+        pass
+
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        _DPI_READY = True
+        return "per_monitor_v1"
+    except Exception:
+        pass
+
+    try:
+        user32.SetProcessDPIAware()
+        _DPI_READY = True
+        return "system"
+    except Exception:
+        return "none"
 
 
 @dataclass
@@ -36,6 +74,10 @@ class Rect:
 
     def as_tuple(self) -> tuple[int, int, int, int]:
         return self.left, self.top, self.right, self.bottom
+
+    @classmethod
+    def from_tuple(cls, t: tuple[int, int, int, int] | list[int]) -> "Rect":
+        return cls(int(t[0]), int(t[1]), int(t[2]), int(t[3]))
 
 
 @dataclass
@@ -63,6 +105,38 @@ def get_window_rect(hwnd: int) -> Rect:
     return Rect(left, top, right, bottom)
 
 
+def is_same_window(hwnd: int, pid: int) -> bool:
+    """Validate HWND still belongs to the expected PID."""
+    try:
+        hwnd_i = int(hwnd)
+        pid_i = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if not hwnd_i or not win32gui.IsWindow(hwnd_i):
+        return False
+    try:
+        _, actual = win32process.GetWindowThreadProcessId(hwnd_i)
+        return int(actual) == pid_i
+    except Exception:
+        return False
+
+
+def window_info_from_hwnd(hwnd: int) -> Optional[WindowInfo]:
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return None
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return WindowInfo(
+            hwnd=int(hwnd),
+            title=win32gui.GetWindowText(hwnd),
+            pid=int(pid),
+            process_name=_process_name(pid),
+            rect=get_window_rect(hwnd),
+        )
+    except Exception:
+        return None
+
+
 def is_visible_top_level(hwnd: int, *, allow_minimized: bool = False) -> bool:
     if not win32gui.IsWindow(hwnd):
         return False
@@ -70,7 +144,6 @@ def is_visible_top_level(hwnd: int, *, allow_minimized: bool = False) -> bool:
         return False
     if win32gui.GetParent(hwnd):
         return False
-    # Skip tool windows / owned popups that are not main frames.
     ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
     if ex_style & win32con.WS_EX_TOOLWINDOW:
         return False
@@ -86,21 +159,9 @@ def enum_top_level_windows(*, allow_minimized: bool = False) -> list[WindowInfo]
     def _callback(hwnd: int, _: object) -> bool:
         if not is_visible_top_level(hwnd, allow_minimized=allow_minimized):
             return True
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            name = _process_name(pid)
-            title = win32gui.GetWindowText(hwnd)
-            results.append(
-                WindowInfo(
-                    hwnd=hwnd,
-                    title=title,
-                    pid=pid,
-                    process_name=name,
-                    rect=get_window_rect(hwnd),
-                )
-            )
-        except Exception:
-            pass
+        info = window_info_from_hwnd(hwnd)
+        if info:
+            results.append(info)
         return True
 
     win32gui.EnumWindows(_callback, None)
@@ -109,56 +170,106 @@ def enum_top_level_windows(*, allow_minimized: bool = False) -> list[WindowInfo]
 
 def find_windows_by_process(
     process_name: str,
-    title_hint: str = "",
     *,
     allow_minimized: bool = False,
 ) -> list[WindowInfo]:
     target = _normalize(process_name)
-    hint = title_hint.lower().strip()
-    matched: list[WindowInfo] = []
-    for info in enum_top_level_windows(allow_minimized=allow_minimized):
-        if _normalize(info.process_name) != target:
-            continue
-        if hint and hint not in info.title.lower():
-            # Soft filter: keep if no better match later.
-            continue
-        matched.append(info)
-
-    if matched:
-        return matched
-
-    # Fallback without title hint if hint filtered everything out.
-    if hint:
-        return [
-            info
-            for info in enum_top_level_windows(allow_minimized=allow_minimized)
-            if _normalize(info.process_name) == target
-        ]
-    return []
+    return [
+        info
+        for info in enum_top_level_windows(allow_minimized=allow_minimized)
+        if _normalize(info.process_name) == target
+    ]
 
 
-def pick_best_window(windows: Iterable[WindowInfo]) -> Optional[WindowInfo]:
+def pick_best_window(
+    windows: Iterable[WindowInfo],
+    title_hint: str = "",
+) -> Optional[WindowInfo]:
     windows = list(windows)
     if not windows:
         return None
+    hint = title_hint.lower().strip()
 
-    def _score(w: WindowInfo) -> tuple[int, int]:
+    def _score(w: WindowInfo) -> tuple[int, int, int, int]:
         minimized = 1 if win32gui.IsIconic(w.hwnd) else 0
-        # Prefer non-minimized, then largest area (main editor over tiny dialogs).
+        title_boost = 1 if hint and hint in w.title.lower() else 0
+        title_l = w.title.lower()
+        penalty = 1 if "settings" in title_l else 0
         area = abs(w.rect.width * w.rect.height)
-        return (-minimized, area)
+        return (-minimized, -penalty, title_boost, area)
 
     return max(windows, key=_score)
 
 
-def find_obsidian_window(process_name: str, title_hint: str) -> Optional[WindowInfo]:
-    return pick_best_window(find_windows_by_process(process_name, title_hint))
+def find_obsidian_window(process_name: str, title_hint: str = "") -> Optional[WindowInfo]:
+    return pick_best_window(find_windows_by_process(process_name), title_hint)
 
 
-def find_cursor_window(process_name: str, title_hint: str) -> Optional[WindowInfo]:
-    return pick_best_window(find_windows_by_process(process_name, title_hint))
+def find_cursor_window(process_name: str, title_hint: str = "") -> Optional[WindowInfo]:
+    return pick_best_window(find_windows_by_process(process_name), title_hint)
+
+
+def find_cursor_hwnd_any(process_name: str, title_hint: str = "") -> Optional[WindowInfo]:
+    found: list[WindowInfo] = []
+    target = _normalize(process_name)
+
+    def _callback(hwnd: int, _: object) -> bool:
+        if not win32gui.IsWindow(hwnd) or win32gui.GetParent(hwnd):
+            return True
+        title = win32gui.GetWindowText(hwnd)
+        if not title.strip():
+            return True
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if _normalize(_process_name(pid)) != target:
+                return True
+            found.append(
+                WindowInfo(
+                    hwnd=hwnd,
+                    title=title,
+                    pid=pid,
+                    process_name=_process_name(pid),
+                    rect=get_window_rect(hwnd),
+                )
+            )
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(_callback, None)
+    return pick_best_window(found, title_hint)
+
+
+def resolve_bound_window(
+    binding: dict[str, Any] | None,
+    process_name: str,
+    title_hint: str = "",
+    *,
+    allow_hidden: bool = False,
+) -> Optional[WindowInfo]:
+    """Prefer previously bound HWND+PID; rediscover only if stale."""
+    if binding:
+        hwnd = int(binding.get("hwnd") or 0)
+        pid = int(binding.get("pid") or 0)
+        if is_same_window(hwnd, pid):
+            info = window_info_from_hwnd(hwnd)
+            if info:
+                return info
+    if allow_hidden and _normalize(process_name) == "cursor":
+        return find_cursor_hwnd_any(process_name, title_hint)
+    return pick_best_window(find_windows_by_process(process_name), title_hint)
+
+
+def get_work_area_for_hwnd(hwnd: int) -> Rect:
+    """Monitor work area for a window — no monitor-index round trip."""
+    hmon = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    info = win32api.GetMonitorInfo(hmon)
+    work = info["Work"]
+    return Rect(work[0], work[1], work[2], work[3])
+
 
 def get_monitor_work_area(monitor_index: int = 0) -> Rect:
+    """Advanced: fixed monitor index (enumeration order). Prefer get_work_area_for_hwnd."""
     monitors: list[Rect] = []
 
     def _enum(hmonitor: int, _hdc: int, _lprect: object, _data: object) -> int:
@@ -169,11 +280,9 @@ def get_monitor_work_area(monitor_index: int = 0) -> Rect:
 
     win32api.EnumDisplayMonitors(None, None, _enum, None)
     if not monitors:
-        # Primary screen fallback.
         w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
         return Rect(0, 0, w, h)
-
     if monitor_index < 0 or monitor_index >= len(monitors):
         raise ValueError(
             f"monitor index {monitor_index} out of range (found {len(monitors)} monitors)"
@@ -181,19 +290,69 @@ def get_monitor_work_area(monitor_index: int = 0) -> Rect:
     return monitors[monitor_index]
 
 
-def monitor_index_for_window(hwnd: int) -> int:
-    hmonitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
-    monitors: list[int] = []
+def monitor_snapshot_for_hwnd(hwnd: int) -> dict[str, Any]:
+    hmon = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    info = win32api.GetMonitorInfo(hmon)
+    work = info["Work"]
+    monitor = info["Monitor"]
+    return {
+        "work": [int(work[0]), int(work[1]), int(work[2]), int(work[3])],
+        "monitor": [int(monitor[0]), int(monitor[1]), int(monitor[2]), int(monitor[3])],
+        "device": str(info.get("Device", "")),
+    }
 
-    def _enum(hmon: int, _hdc: int, _lprect: object, _data: object) -> int:
-        monitors.append(hmon)
-        return 1
 
-    win32api.EnumDisplayMonitors(None, None, _enum, None)
-    try:
-        return monitors.index(hmonitor)
-    except ValueError:
-        return 0
+def snapshot_window(hwnd: int) -> dict[str, Any]:
+    """Full original state for Attach → Detach restore."""
+    placement = win32gui.GetWindowPlacement(hwnd)
+    flags, show_cmd, min_pos, max_pos, normal = placement
+    return {
+        "hwnd": int(hwnd),
+        "pid": int(win32process.GetWindowThreadProcessId(hwnd)[1]),
+        "title": win32gui.GetWindowText(hwnd),
+        "original_rect": list(get_window_rect(hwnd).as_tuple()),
+        "original_window_placement": placement_dict(
+            flags, show_cmd, min_pos, max_pos, normal
+        ),
+        "original_monitor": monitor_snapshot_for_hwnd(hwnd),
+        "original_visibility": bool(win32gui.IsWindowVisible(hwnd)),
+        "maximized": show_cmd == win32con.SW_SHOWMAXIMIZED,
+        "minimized": show_cmd == win32con.SW_SHOWMINIMIZED or bool(win32gui.IsIconic(hwnd)),
+    }
+
+
+def apply_window_placement(hwnd: int, snap: dict[str, Any]) -> bool:
+    """Restore via SetWindowPlacement; Rect fallback if needed."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+
+    placement = snap.get("original_window_placement")
+    if placement:
+        try:
+            # SetWindowPlacement wants (flags, showCmd, ptMin, ptMax, rcNormal)
+            tup = placement_tuple(placement)
+            win32gui.SetWindowPlacement(hwnd, tup)
+            # Re-apply visibility preference if explicitly hidden before attach
+            if snap.get("original_visibility") is False:
+                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+            return True
+        except Exception:
+            pass
+
+    # Fallback: SetWindowPos from original_rect / normal_position
+    rect_src = snap.get("original_rect")
+    if not rect_src and placement:
+        rect_src = placement.get("normal_position")
+    if not rect_src or len(rect_src) != 4:
+        return False
+    rect = Rect.from_tuple(rect_src)
+    restore_if_maximized_or_minimized(hwnd)
+    set_window_rect(hwnd, rect, activate=False)
+    if snap.get("maximized"):
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+    if snap.get("original_visibility") is False:
+        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+    return True
 
 
 def restore_if_maximized_or_minimized(hwnd: int) -> None:
@@ -214,7 +373,6 @@ def set_window_rect(hwnd: int, rect: Rect, activate: bool = False) -> None:
     )
     if not activate:
         flags |= win32con.SWP_NOACTIVATE
-
     win32gui.SetWindowPos(
         hwnd,
         win32con.HWND_TOP,
@@ -232,22 +390,10 @@ def compute_split_rects(
     cursor_ratio: float,
     gap: int,
 ) -> tuple[Rect, Rect]:
-    total = obsidian_ratio + cursor_ratio
-    if total <= 0:
-        raise ValueError("obsidian_ratio + cursor_ratio must be > 0")
-
-    usable = max(work.width - max(gap, 0), 1)
-    left_w = int(round(usable * (obsidian_ratio / total)))
-    right_w = usable - left_w
-
-    left = Rect(work.left, work.top, work.left + left_w, work.bottom)
-    right = Rect(
-        work.left + left_w + max(gap, 0),
-        work.top,
-        work.left + left_w + max(gap, 0) + right_w,
-        work.bottom,
+    left_t, right_t = _compute_split_rects_pure(
+        work.as_tuple(), obsidian_ratio, cursor_ratio, gap
     )
-    return left, right
+    return Rect.from_tuple(left_t), Rect.from_tuple(right_t)
 
 
 def expand_path(path: str) -> str:
@@ -300,48 +446,23 @@ def wait_for_window(
     return None
 
 
-def arrange_sidecar(
+def arrange_bound_windows(
+    obsidian: WindowInfo,
+    cursor: WindowInfo,
     *,
-    obsidian_process: str,
-    cursor_process: str,
-    obsidian_title_hint: str,
-    cursor_title_hint: str,
     obsidian_ratio: float,
     cursor_ratio: float,
     gap: int,
     monitor: Optional[int] = None,
-) -> tuple[WindowInfo, WindowInfo, Rect, Rect]:
-    obsidian = find_obsidian_window(obsidian_process, obsidian_title_hint)
-    cursor = find_cursor_window(cursor_process, cursor_title_hint)
-    if not obsidian:
-        raise RuntimeError(f"Obsidian window not found ({obsidian_process})")
-    if not cursor:
-        raise RuntimeError(f"Cursor window not found ({cursor_process})")
-
-    if monitor is None:
-        monitor = monitor_index_for_window(obsidian.hwnd)
-    work = get_monitor_work_area(monitor)
+) -> tuple[Rect, Rect]:
+    if monitor is None or monitor == "auto":
+        work = get_work_area_for_hwnd(obsidian.hwnd)
+    else:
+        work = get_monitor_work_area(int(monitor))
     left, right = compute_split_rects(work, obsidian_ratio, cursor_ratio, gap)
-
     set_window_rect(obsidian.hwnd, left, activate=False)
     set_window_rect(cursor.hwnd, right, activate=False)
-
-    # Refresh rects after move.
-    obsidian = WindowInfo(
-        hwnd=obsidian.hwnd,
-        title=obsidian.title,
-        pid=obsidian.pid,
-        process_name=obsidian.process_name,
-        rect=get_window_rect(obsidian.hwnd),
-    )
-    cursor = WindowInfo(
-        hwnd=cursor.hwnd,
-        title=cursor.title,
-        pid=cursor.pid,
-        process_name=cursor.process_name,
-        rect=get_window_rect(cursor.hwnd),
-    )
-    return obsidian, cursor, left, right
+    return left, right
 
 
 def show_window(hwnd: int) -> None:
@@ -356,48 +477,43 @@ def hide_window(hwnd: int) -> None:
     win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
 
 
-def toggle_cursor_visibility(process_name: str, title_hint: str) -> str:
-    """Toggle Cursor main window. Returns 'shown' or 'hidden'."""
-    # Include hidden windows for toggle-back.
-    found: list[WindowInfo] = []
-    target = _normalize(process_name)
-    hint = title_hint.lower().strip()
+def focus_window(hwnd: int) -> None:
+    show_window(hwnd)
 
-    def _callback(hwnd: int, _: object) -> bool:
-        if not win32gui.IsWindow(hwnd):
-            return True
-        if win32gui.GetParent(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd)
-        if not title.strip():
-            return True
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            name = _process_name(pid)
-            if _normalize(name) != target:
-                return True
-            if hint and hint not in title.lower():
-                return True
-            found.append(
-                WindowInfo(
-                    hwnd=hwnd,
-                    title=title,
-                    pid=pid,
-                    process_name=name,
-                    rect=get_window_rect(hwnd),
-                )
-            )
-        except Exception:
-            pass
-        return True
 
-    win32gui.EnumWindows(_callback, None)
-    win_info = pick_best_window(found)
+def toggle_cursor_visibility(
+    process_name: str,
+    title_hint: str = "",
+    binding: dict[str, Any] | None = None,
+) -> str:
+    win_info = resolve_bound_window(
+        binding, process_name, title_hint, allow_hidden=True
+    )
     if not win_info:
         raise RuntimeError(f"Cursor window not found ({process_name})")
-
     if win32gui.IsWindowVisible(win_info.hwnd):
         hide_window(win_info.hwnd)
         return "hidden"
     show_window(win_info.hwnd)
     return "shown"
+
+
+# Back-compat alias used by older call sites
+def arrange_sidecar(**kwargs: Any) -> tuple[WindowInfo, WindowInfo, Rect, Rect]:
+    obs = find_obsidian_window(kwargs["obsidian_process"], kwargs.get("obsidian_title_hint", ""))
+    cur = find_cursor_window(kwargs["cursor_process"], kwargs.get("cursor_title_hint", ""))
+    if not obs:
+        raise RuntimeError("Obsidian window not found")
+    if not cur:
+        raise RuntimeError("Cursor window not found")
+    left, right = arrange_bound_windows(
+        obs,
+        cur,
+        obsidian_ratio=kwargs["obsidian_ratio"],
+        cursor_ratio=kwargs["cursor_ratio"],
+        gap=kwargs["gap"],
+        monitor=kwargs.get("monitor"),
+    )
+    obs = window_info_from_hwnd(obs.hwnd) or obs
+    cur = window_info_from_hwnd(cur.hwnd) or cur
+    return obs, cur, left, right

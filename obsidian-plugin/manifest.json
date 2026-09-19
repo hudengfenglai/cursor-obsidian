@@ -1,9 +1,9 @@
 {
   "id": "cursor-sidecar",
   "name": "Cursor Sidecar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Dock real Cursor Desktop beside Obsidian via the Windows sidecar helper. Does not embed or modify Cursor.",
+  "description": "Attach/Detach real Cursor Desktop beside Obsidian with full window restore. Win32 sidecar — no Cursor injection.",
   "author": "hudengfenglai",
   "authorUrl": "https://github.com/hudengfenglai/cursor-obsidian",
   "isDesktopOnly": true

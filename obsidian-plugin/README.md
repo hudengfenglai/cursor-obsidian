@@ -1,43 +1,21 @@
-# Obsidian plugin — Cursor Sidecar
+# Obsidian plugin — Cursor Sidecar v0.2
 
-Ribbon button + commands that call the local Python helper in `../cursor-sidecar`.
+Ribbon: **Attach / Detach** (calls `python main.py click`).
 
-## Install into a vault
+## Setup
 
-Copy (or junction) this folder to:
+1. Copy this folder to `<vault>/.obsidian/plugins/cursor-sidecar/`
+2. Enable the plugin
+3. Settings → set **Sidecar directory** (folder with `main.py`)
 
-```text
-<vault>/.obsidian/plugins/cursor-sidecar/
-```
+Existing saved settings are kept. New installs default to empty paths (must configure once).
 
-Required files:
+## Commands
 
-- `manifest.json`
-- `main.js`
-- `styles.css`
-
-Then in Obsidian: **Settings → Community plugins → enable “Cursor Sidecar”** (turn off Safe mode if needed).
-
-## Settings
-
-| Setting | Purpose |
-|---------|---------|
-| Sidecar directory | Path to `cursor-sidecar` (contains `main.py`) |
-| Python path | Prefer `.venv\Scripts\python.exe` |
-| Open vault in Cursor | Pass vault path on dock/click |
-| Show notices | Toast feedback |
-
-## Ribbon
-
-Click the filled-circle icon:
-
-- Cursor not running → launch Cursor (open vault) + arrange 70/30
-- Cursor running → show/hide Cursor window
-
-## Commands (Command Palette)
-
-- Toggle / dock Cursor
-- Dock Cursor (launch + arrange)
-- Arrange windows
+- Attach / Detach Cursor Sidecar
+- Attach Cursor Sidecar
+- Detach Cursor Sidecar
+- Arrange Sidecar
+- Focus Cursor
 - Show / hide Cursor
 - Sidecar status

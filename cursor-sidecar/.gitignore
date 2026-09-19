@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 .sidecar.pid
+.sidecar.daemon.pid
 .sidecar.state.json
