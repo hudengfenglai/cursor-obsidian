@@ -143,10 +143,14 @@ class CursorSidecarPlugin extends Plugin {
     // Context Follow state (plugin-local; no duplicate listeners on reload)
     this._cfTimer = null;
     this._cfGen = 0;
+    this._cfSeq = 0;
     this._cfLastPath = null;
     this._cfLastLine = null;
     this._cfLastSyncAt = 0;
     this._cfLastRelative = null;
+    this._cfLastErrorAt = 0;
+    this._cfLastErrorKey = "";
+    this._cfDaemonOk = false;
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
         this.onContextFollowFileOpen(file);
@@ -462,6 +466,26 @@ class CursorSidecarPlugin extends Plugin {
     return false;
   }
 
+  notifyContextFollowError(key, message) {
+    const now = Date.now();
+    if (key === this._cfLastErrorKey && now - (this._cfLastErrorAt || 0) < 30000) {
+      return;
+    }
+    this._cfLastErrorKey = key;
+    this._cfLastErrorAt = now;
+    this.notify(message, true);
+  }
+
+  async clearContextSyncPending() {
+    try {
+      if (await this.daemonHealthy()) {
+        await this.httpJson("POST", "/rpc", { cmd: "context-sync-clear" });
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
   onContextFollowFileOpen(file) {
     if (!this.settings.contextFollow) return;
     if (!(file instanceof TFile)) return;
@@ -499,7 +523,7 @@ class CursorSidecarPlugin extends Plugin {
       }
     }
 
-    // Same-file suppression
+    // Same-file suppression (auto only — manual Open never uses this path)
     if (
       this._cfLastPath === absPath &&
       this._cfLastLine === line &&
@@ -509,26 +533,41 @@ class CursorSidecarPlugin extends Plugin {
     }
 
     try {
-      const up = await this.ensureDaemon();
-      if (!up) return null;
-      // Attached-only: probe status quickly
+      let up = this._cfDaemonOk ? await this.daemonHealthy() : false;
+      if (!up) {
+        up = await this.ensureDaemon();
+        this._cfDaemonOk = !!up;
+      }
+      if (!up) {
+        this.notifyContextFollowError("daemon", "Cursor Sidecar: daemon unavailable");
+        return null;
+      }
       const st = await this.httpJson("GET", "/status").catch(() => null);
       const status = (st && st.status) || st || {};
       if (!status.attached) return null;
-      if (status.cursor_binding && status.cursor_binding.ok === false) return null;
+      if (status.cursor_binding && status.cursor_binding.ok === false) {
+        this.notifyContextFollowError("binding", "Cursor Sidecar: binding gone — Context Follow idle");
+        return null;
+      }
 
+      this._cfSeq += 1;
       const body = {
         cmd: "sync-editor-file",
         vault_root: vaultRoot,
         path: absPath,
         relative_path: file.path,
+        seq: this._cfSeq,
       };
       if (line !== null) body.line = line;
       if (column !== null) body.column = column;
 
       const result = await this.httpJson("POST", "/rpc", body);
+      // Success: no Notice (silent follow)
       if (!result || result.ok === false) {
-        // Silent: attached/stale/excluded — no notice spam
+        const err = (result && result.error) || "sync failed";
+        if (err === "sidecar_not_attached" || err === "stale_binding") {
+          this.notifyContextFollowError(err, `Cursor Sidecar: ${err}`);
+        }
         return null;
       }
       this._cfLastPath = absPath;
@@ -796,7 +835,7 @@ class CursorSidecarSettingTab extends PluginSettingTab {
       text: `Binary: ${helper.mode === "packaged" && helper.binaryFound ? "Found" : helper.mode === "packaged" ? "Missing" : "n/a (source)"}`,
     });
     status.createEl("p", {
-      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.5.0"}`,
+      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.6.0"}`,
     });
     const daemonLine = status.createEl("p", { text: "Daemon: …" });
     this.plugin
@@ -824,28 +863,31 @@ class CursorSidecarSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Context Follow")
-      .setDesc("Automatically keep Cursor on the active Obsidian file (silent; does not steal focus). Requires Attach.")
+      .setDesc("Automatically keep the bound Cursor Editor on the active Obsidian file (silent; does not steal focus). Requires Attach.")
       .addToggle((toggle) =>
         toggle.setValue(!!this.plugin.settings.contextFollow).onChange(async (value) => {
           this.plugin.settings.contextFollow = !!value;
           await this.plugin.saveSettings();
-          if (!value) {
-            this.plugin._cfGen += 1;
-            if (this.plugin._cfTimer) {
-              clearTimeout(this.plugin._cfTimer);
-              this.plugin._cfTimer = null;
-            }
+          this.plugin._cfGen += 1;
+          if (this.plugin._cfTimer) {
+            clearTimeout(this.plugin._cfTimer);
+            this.plugin._cfTimer = null;
           }
+          if (!value) {
+            await this.plugin.clearContextSyncPending();
+          }
+          // ON: wait for next file-open (no immediate sync)
           this.display();
         })
       );
 
-    if (this.plugin.settings.contextFollow || this.plugin._cfLastRelative) {
-      const cf = containerEl.createEl("p", {
-        cls: "setting-item-description",
-        text: `Context Follow last: ${this.plugin._cfLastRelative || "(none)"}`,
+    status.createEl("p", {
+      text: `Context Follow: ${this.plugin.settings.contextFollow ? "On" : "Off"}`,
+    });
+    if (this.plugin._cfLastRelative) {
+      status.createEl("p", {
+        text: `Last sync: ${this.plugin._cfLastRelative}`,
       });
-      void cf;
     }
 
     new Setting(containerEl)

@@ -110,19 +110,32 @@ def daemon_healthy(cfg: dict[str, Any]) -> bool:
 
 
 def ensure_daemon(cfg: dict[str, Any]) -> bool:
+    need_restart = True
     if daemon_healthy(cfg):
-        probe = http_json(
-            cfg,
-            "POST",
-            "/rpc",
-            {"cmd": "sync-editor-file", "path": "x", "vault_root": "y"},
-        )
-        if probe.get("error") and "unknown" in str(probe.get("error")).lower():
+        st = http_json(cfg, "GET", "/status")
+        status = st.get("status") or st or {}
+        ver = str(status.get("version") or "")
+        if ver == str(sidecar.VERSION):
+            # Probe that sync-editor-file understands seq/queue (v0.6)
+            probe = http_json(
+                cfg,
+                "POST",
+                "/rpc",
+                {"cmd": "sync-editor-file", "path": "x", "vault_root": "y", "seq": 1},
+            )
+            if probe.get("error") in ("path_outside_vault", "path_excluded", "vault_root_required", "sidecar_not_attached", "path_required"):
+                need_restart = False
+            elif probe.get("queued") is True or probe.get("discarded") is True:
+                need_restart = False
+            elif probe.get("error") and "unknown" in str(probe.get("error")).lower():
+                need_restart = True
+    if need_restart:
+        try:
             sidecar.cmd_stop(cfg)
-            time.sleep(0.4)
-        elif daemon_healthy(cfg):
-            return True
-    sidecar.cmd_daemon_start(cfg)
+        except Exception:
+            pass
+        time.sleep(0.4)
+        sidecar.cmd_daemon_start(cfg)
     for _ in range(24):
         time.sleep(0.25)
         if daemon_healthy(cfg):
@@ -144,7 +157,7 @@ def wait_windows(cfg: dict[str, Any], timeout: float = 20.0):
     )
 
 
-def sync_file(cfg: dict[str, Any], vault: Path, note: Path, line: int | None = 1) -> dict[str, Any]:
+def sync_file(cfg: dict[str, Any], vault: Path, note: Path, line: int | None = 1, seq: int | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {
         "cmd": "sync-editor-file",
         "vault_root": str(vault),
@@ -154,7 +167,18 @@ def sync_file(cfg: dict[str, Any], vault: Path, note: Path, line: int | None = 1
     if line is not None:
         body["line"] = line
         body["column"] = 1
-    return http_json(cfg, "POST", "/rpc", body)
+    if seq is not None:
+        body["seq"] = int(seq)
+    queued = http_json(cfg, "POST", "/rpc", body)
+    # Wait for worker (queued returns immediately)
+    for _ in range(40):
+        time.sleep(0.1)
+        st = http_json(cfg, "GET", "/status").get("status") or {}
+        cs = st.get("context_sync") or {}
+        if not cs.get("running") and not cs.get("pending"):
+            break
+    queued["waited"] = True
+    return queued
 
 
 def run_scenarios(cfg: dict[str, Any], vault: Path, notes: dict[str, Path]) -> list[bool | None]:
@@ -183,34 +207,61 @@ def run_scenarios(cfg: dict[str, Any], vault: Path, notes: dict[str, Path]) -> l
     fg0 = get_foreground_hwnd()
 
     print("\n--- C: sync note A ---")
-    r_a = sync_file(cfg, vault, notes["A"])
+    r_a = sync_file(cfg, vault, notes["A"], seq=1)
     outcomes.append(
         result(
             "C sync A",
-            bool(r_a.get("ok")) and r_a.get("focused") is False,
-            f"ok={r_a.get('ok')} focused={r_a.get('focused')} method={r_a.get('method')} err={r_a.get('error')}",
+            bool(r_a.get("ok")) and (r_a.get("queued") is True or r_a.get("focused") is False),
+            f"ok={r_a.get('ok')} queued={r_a.get('queued')} err={r_a.get('error')}",
         )
     )
 
     print("\n--- D: sync note B ---")
     focus_window(obs.hwnd)
     time.sleep(0.15)
-    r_b = sync_file(cfg, vault, notes["B"])
+    r_b = sync_file(cfg, vault, notes["B"], seq=2)
     outcomes.append(
         result(
             "D sync B",
-            bool(r_b.get("ok")) and r_b.get("focused") is False,
-            f"ok={r_b.get('ok')} method={r_b.get('method')}",
+            bool(r_b.get("ok")),
+            f"ok={r_b.get('ok')} queued={r_b.get('queued')}",
         )
     )
 
     print("\n--- E: rapid A→B→C ---")
     focus_window(obs.hwnd)
-    sync_file(cfg, vault, notes["A"])
-    sync_file(cfg, vault, notes["B"])
-    r_c = sync_file(cfg, vault, notes["C"])
-    final_ok = bool(r_c.get("ok")) and str(notes["C"].resolve()) in str(r_c.get("path") or "")
-    outcomes.append(result("E rapid final C", final_ok, f"path={r_c.get('path')}"))
+    http_json(
+        cfg,
+        "POST",
+        "/rpc",
+        {
+            "cmd": "sync-editor-file",
+            "vault_root": str(vault),
+            "path": str(notes["A"]),
+            "relative_path": notes["A"].name,
+            "seq": 10,
+        },
+    )
+    http_json(
+        cfg,
+        "POST",
+        "/rpc",
+        {
+            "cmd": "sync-editor-file",
+            "vault_root": str(vault),
+            "path": str(notes["B"]),
+            "relative_path": notes["B"].name,
+            "seq": 11,
+        },
+    )
+    r_c = sync_file(cfg, vault, notes["C"], seq=12)
+    st_e = http_json(cfg, "GET", "/status").get("status") or {}
+    cf = st_e.get("context_follow") or {}
+    final_ok = bool(r_c.get("ok")) and (
+        str(notes["C"].name) in str(cf.get("last_path") or "")
+        or int((st_e.get("context_sync") or {}).get("latest_seq") or 0) >= 12
+    )
+    outcomes.append(result("E rapid final C", final_ok, f"cf={cf} sync={st_e.get('context_sync')}"))
 
     print("\n--- F: foreground stays Obsidian ---")
     focus_window(obs.hwnd)

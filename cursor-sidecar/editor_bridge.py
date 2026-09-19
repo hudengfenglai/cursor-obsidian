@@ -356,8 +356,10 @@ class EditorBridge:
         column: int | None = None,
         focus: bool = True,
         preserve_foreground: bool | None = None,
+        routing_check: bool = True,
+        obsidian_hwnd: int | None = None,
         get_foreground_hwnd: Optional[Callable[[], int]] = None,
-        restore_if_stolen: Optional[Callable[[int], dict[str, Any]]] = None,
+        restore_if_stolen: Optional[Callable[..., dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         resolved = get_bound_cursor_executable(binding, validate_fn=self.validate_binding)
         if not resolved.get("ok"):
@@ -382,7 +384,9 @@ class EditorBridge:
             except Exception:
                 fg_before = 0
 
-        before = self.list_cursor_hwnds(self.process_name)
+        before: list[int] = []
+        if routing_check:
+            before = self.list_cursor_hwnds(self.process_name)
         hwnd = int(resolved["hwnd"])
         if focus:
             try:
@@ -398,17 +402,34 @@ class EditorBridge:
             column=col_i,
             is_folder=False,
         )
-        time.sleep(self.routing_wait_s)
-        after = self.list_cursor_hwnds(self.process_name)
-        new_hwnds = detect_new_cursor_windows(before, after)
+
+        new_hwnds: list[int] = []
+        if routing_check:
+            time.sleep(self.routing_wait_s)
+            after = self.list_cursor_hwnds(self.process_name)
+            new_hwnds = detect_new_cursor_windows(before, after)
 
         focus_meta: dict[str, Any] = {}
         if do_preserve and fg_before and restore_if_stolen is not None:
             try:
-                focus_meta = dict(restore_if_stolen(fg_before) or {})
+                # Prefer keyword signature used by restore_foreground_if_cursor_stole_focus
+                focus_meta = dict(
+                    restore_if_stolen(
+                        foreground_before=fg_before,
+                        obsidian_hwnd=int(obsidian_hwnd or fg_before),
+                        cursor_hwnd=hwnd,
+                    )
+                    or {}
+                )
+            except TypeError:
+                try:
+                    focus_meta = dict(restore_if_stolen(fg_before) or {})
+                except Exception as exc:  # noqa: BLE001
+                    log.info("foreground restore failed: %s", exc)
+                    focus_meta = {"stolen": True, "restored": False, "error": str(exc)}
             except Exception as exc:  # noqa: BLE001
                 log.info("foreground restore failed: %s", exc)
-                focus_meta = {"stolen": True, "restored": False, "error": str(exc)}
+                focus_meta = {"stolen_by_cursor": False, "restored": False, "error": str(exc)}
 
         out: dict[str, Any] = {
             "ok": bool(result.get("ok")),
@@ -420,11 +441,16 @@ class EditorBridge:
             "bound_hwnd": hwnd,
             "bound_pid": resolved["pid"],
             "focused": bool(focus),
+            "routing_check": bool(routing_check),
         }
         if focus_meta:
-            out["focus_stolen"] = bool(focus_meta.get("stolen"))
+            out["focus_stolen"] = bool(
+                focus_meta.get("stolen") or focus_meta.get("stolen_by_cursor")
+            )
             out["focus_restored"] = bool(focus_meta.get("restored"))
             out["foreground_hwnd"] = focus_meta.get("foreground_after")
+            if focus_meta.get("skipped_reason"):
+                out["focus_skip"] = focus_meta.get("skipped_reason")
         if new_hwnds:
             out["routing_warning"] = "new_cursor_window_created"
             out["new_hwnds"] = new_hwnds

@@ -569,6 +569,76 @@ def restore_foreground_hwnd(hwnd: int) -> bool:
         return False
 
 
+def get_foreground_window() -> int:
+    """Alias for get_foreground_hwnd (spec naming)."""
+    return get_foreground_hwnd()
+
+
+def should_restore_obsidian_focus(
+    *,
+    foreground_before: int,
+    foreground_after: int,
+    obsidian_hwnd: int,
+    cursor_hwnd: int,
+) -> bool:
+    """Pure decision — imported from context_sync for a single source of truth."""
+    from context_sync import should_restore_obsidian_focus as _decide
+
+    return _decide(
+        foreground_before=foreground_before,
+        foreground_after=foreground_after,
+        obsidian_hwnd=obsidian_hwnd,
+        cursor_hwnd=cursor_hwnd,
+    )
+
+
+def restore_foreground_if_cursor_stole_focus(
+    *,
+    foreground_before: int,
+    obsidian_hwnd: int,
+    cursor_hwnd: int,
+    settle_s: float = 0.09,
+    get_fg: Callable[[], int] | None = None,
+    restore_fn: Callable[[int], bool] | None = None,
+) -> dict[str, Any]:
+    """
+    After silent Cursor open: restore Obsidian only if focus moved
+    Obsidian → bound Cursor. Never yank focus back from other apps.
+    """
+    get_fg = get_fg or get_foreground_hwnd
+    restore_fn = restore_fn or restore_foreground_hwnd
+    out: dict[str, Any] = {
+        "foreground_before": int(foreground_before or 0),
+        "foreground_after": 0,
+        "stolen_by_cursor": False,
+        "restored": False,
+        "skipped_reason": "",
+    }
+    time.sleep(max(0.0, float(settle_s)))
+    after = int(get_fg() or 0)
+    out["foreground_after"] = after
+    if not should_restore_obsidian_focus(
+        foreground_before=int(foreground_before or 0),
+        foreground_after=after,
+        obsidian_hwnd=int(obsidian_hwnd or 0),
+        cursor_hwnd=int(cursor_hwnd or 0),
+    ):
+        if after == int(foreground_before or 0):
+            out["skipped_reason"] = "still_original"
+        elif after == int(obsidian_hwnd or 0):
+            out["skipped_reason"] = "still_obsidian"
+        else:
+            out["skipped_reason"] = "user_elsewhere_or_other"
+        return out
+    out["stolen_by_cursor"] = True
+    if restore_fn(int(obsidian_hwnd)):
+        time.sleep(0.05)
+        final = int(get_fg() or 0)
+        out["foreground_after"] = final
+        out["restored"] = final == int(obsidian_hwnd)
+    return out
+
+
 def restore_foreground_if_stolen(
     original_hwnd: int,
     *,
@@ -577,8 +647,8 @@ def restore_foreground_if_stolen(
     retry_delay_s: float = 0.08,
 ) -> dict[str, Any]:
     """
-    If foreground left original_hwnd (e.g. Cursor activated), restore it.
-    Prefer avoiding steal; this is the safety net for silent Context Follow.
+    Legacy helper: restore if foreground left original_hwnd.
+    Prefer restore_foreground_if_cursor_stole_focus for Context Follow.
     """
     out: dict[str, Any] = {
         "original": int(original_hwnd or 0),

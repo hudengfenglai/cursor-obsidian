@@ -30,6 +30,7 @@ from geometry import (
     resolve_preset,
 )
 from context_follow import ContextFollowGate, is_excluded_rel_path, is_path_inside_vault
+from context_sync import ContextSyncController, SyncJob
 from runtime_paths import (
     DEFAULT_CONFIG_VALUES,
     VERSION,
@@ -53,7 +54,7 @@ from window import (
     launch_process,
     resolve_bound_window,
     resolve_cursor_exe,
-    restore_foreground_if_stolen,
+    restore_foreground_if_cursor_stole_focus,
     snapshot_window,
     toggle_cursor_visibility,
     validate_window_binding,
@@ -80,6 +81,16 @@ _DAEMON_MODE = False
 _STOP_DAEMON = threading.Event()
 _DAEMON_HTTP_SERVER: ThreadingHTTPServer | None = None
 _CONTEXT_FOLLOW_GATE = ContextFollowGate()
+_CONTEXT_SYNC: ContextSyncController | None = None
+
+
+def _get_context_sync() -> ContextSyncController:
+    global _CONTEXT_SYNC
+    if _CONTEXT_SYNC is None:
+        _CONTEXT_SYNC = ContextSyncController(execute=_execute_context_sync_job)
+    else:
+        _CONTEXT_SYNC.set_execute(_execute_context_sync_job)
+    return _CONTEXT_SYNC
 
 LOCALHOST_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -1006,9 +1017,8 @@ def open_editor_file_result(
         line=line,
         column=column,
         focus=bool(focus),
-        preserve_foreground=False if focus else True,
-        get_foreground_hwnd=get_foreground_hwnd,
-        restore_if_stolen=restore_foreground_if_stolen,
+        preserve_foreground=False,
+        routing_check=True,
     )
     # Guarantee Sidecar lifecycle fields untouched
     state_after = read_state()
@@ -1020,6 +1030,49 @@ def open_editor_file_result(
     return result
 
 
+def _execute_context_sync_job(job: SyncJob) -> dict[str, Any]:
+    """Worker body for Context Follow — silent, no routing wait, focus-safe."""
+    cfg = load_config(Path(DEFAULT_CONFIG))
+    truth = refresh_attachment_truth()
+    if not truth["attached"]:
+        return {"ok": False, "error": "sidecar_not_attached", "seq": job.seq}
+    if not validate_window_binding(dict((truth["state"] or {}).get("cursor") or {})).get("ok"):
+        return {"ok": False, "error": "stale_binding", "seq": job.seq}
+
+    state = truth["state"] or {}
+    binding = dict(state.get("cursor") or {})
+    obs_hwnd = 0
+    try:
+        obs_hwnd = int((state.get("obsidian") or {}).get("hwnd") or 0)
+    except (TypeError, ValueError):
+        obs_hwnd = 0
+
+    result = _editor_bridge(cfg).open_file(
+        binding=binding,
+        vault_root=job.vault_root,
+        path=job.path,
+        line=job.line,
+        column=job.column,
+        focus=False,
+        preserve_foreground=True,
+        routing_check=False,
+        obsidian_hwnd=obs_hwnd or None,
+        get_foreground_hwnd=get_foreground_hwnd,
+        restore_if_stolen=restore_foreground_if_cursor_stole_focus,
+    )
+    result["cmd"] = "sync-editor-file"
+    result["focused"] = False
+    result["seq"] = job.seq
+    if result.get("ok"):
+        rel = job.relative_path
+        _CONTEXT_FOLLOW_GATE.record(
+            str(result.get("path") or job.path),
+            result.get("line") if job.line is not None else None,
+            relative_path=rel,
+        )
+    return result
+
+
 def sync_editor_file_result(
     cfg: dict[str, Any],
     *,
@@ -1028,8 +1081,9 @@ def sync_editor_file_result(
     line: int | None = None,
     column: int | None = None,
     relative_path: str | None = None,
+    seq: int | None = None,
 ) -> dict[str, Any]:
-    """Context Follow: silent open in bound Cursor. Always focus=False; never auto-attach."""
+    """Queue Context Follow job (latest-wins). Returns immediately with queued=true."""
     truth = refresh_attachment_truth()
     if not truth["attached"]:
         return {
@@ -1043,7 +1097,6 @@ def sync_editor_file_result(
     if not vault_root:
         return {"ok": False, "error": "vault_root_required", "cmd": "sync-editor-file"}
 
-    # Exclude vault config / hidden system paths
     rel = relative_path
     if not rel:
         try:
@@ -1055,9 +1108,7 @@ def sync_editor_file_result(
     if not is_path_inside_vault(vault_root, path):
         return {"ok": False, "error": "path_outside_vault", "cmd": "sync-editor-file"}
 
-    state_before = read_state()
-    binding = dict(state_before.get("cursor") or {})
-    # Exact bound Cursor only — never rediscover
+    binding = dict((truth["state"] or {}).get("cursor") or {})
     if not validate_window_binding(binding).get("ok"):
         return {
             "ok": False,
@@ -1066,35 +1117,29 @@ def sync_editor_file_result(
             "cmd": "sync-editor-file",
         }
 
-    result = _editor_bridge(cfg).open_file(
-        binding=binding,
-        vault_root=vault_root,
-        path=path,
+    # seq: client-provided, else monotonic time-based fallback
+    if seq is None:
+        seq = int(time.time() * 1000) % 2_000_000_000
+    job = SyncJob(
+        seq=int(seq),
+        vault_root=str(vault_root),
+        path=str(path),
         line=line,
         column=column,
-        focus=False,
-        preserve_foreground=True,
-        get_foreground_hwnd=get_foreground_hwnd,
-        restore_if_stolen=restore_foreground_if_stolen,
+        relative_path=rel,
     )
-    state_after = read_state()
-    for key in ("attached", "preset", "obsidian", "cursor", "left_rect", "right_rect"):
-        if state_before.get(key) != state_after.get(key):
-            result["state_mutation_warning"] = key
-            break
-    result["cmd"] = "sync-editor-file"
-    result["focused"] = False
-    if result.get("ok"):
-        _CONTEXT_FOLLOW_GATE.record(
-            str(result.get("path") or path),
-            result.get("line") if line is not None else None,
-            relative_path=rel,
-        )
-    result["context_follow"] = {
-        "last_path": _CONTEXT_FOLLOW_GATE.last_relative_path or _CONTEXT_FOLLOW_GATE.last_path,
-        "last_sync_at": _CONTEXT_FOLLOW_GATE.last_sync_at or None,
-    }
-    return result
+    ctrl = _get_context_sync()
+    # Ensure executor closed over current cfg path via DEFAULT_CONFIG
+    ctrl.set_execute(_execute_context_sync_job)
+    out = ctrl.submit(job)
+    out["context_sync"] = ctrl.status()
+    return out
+
+
+def clear_context_sync() -> dict[str, Any]:
+    ctrl = _get_context_sync()
+    ctrl.clear_pending()
+    return {"ok": True, "cmd": "context-sync-clear", "context_sync": ctrl.status()}
 
 
 def open_editor_vault_result(
@@ -1160,6 +1205,7 @@ def cmd_sync_editor_file(
     line: int | None = None,
     column: int | None = None,
     relative_path: str | None = None,
+    seq: int | None = None,
     **_: Any,
 ) -> int:
     result = sync_editor_file_result(
@@ -1169,7 +1215,14 @@ def cmd_sync_editor_file(
         line=line,
         column=column,
         relative_path=relative_path,
+        seq=seq,
     )
+    # Wait briefly so CLI users see worker outcome in status (optional)
+    if result.get("queued"):
+        time.sleep(0.35)
+        last = _get_context_sync().last_result()
+        if last:
+            result["result"] = last
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("ok") else 1
 
@@ -1295,6 +1348,7 @@ def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
             "last_path": _CONTEXT_FOLLOW_GATE.last_relative_path or _CONTEXT_FOLLOW_GATE.last_path,
             "last_sync_at": _CONTEXT_FOLLOW_GATE.last_sync_at or None,
         },
+        "context_sync": _get_context_sync().status(),
         "obsidian_binding": {
             "ok": obs_live,
             "legacy_binding": bool(obs_rep.get("legacy_binding")),
@@ -1417,7 +1471,8 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         elif cmd in ("sync-editor-file", "sync_editor_file"):
             line = body.get("line")
             column = body.get("column")
-            # Always silent — ignore any client focus=true
+            seq_raw = body.get("seq")
+            seq = int(seq_raw) if seq_raw is not None else None
             return sync_editor_file_result(
                 cfg,
                 vault_root=body.get("vault_root") or workspace,
@@ -1425,7 +1480,10 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
                 line=int(line) if line is not None else None,
                 column=int(column) if column is not None else None,
                 relative_path=body.get("relative_path") or body.get("rel_path"),
+                seq=seq,
             )
+        elif cmd in ("context-sync-clear", "context_sync_clear", "clear-context-sync"):
+            return clear_context_sync()
         elif cmd in ("open-editor-vault", "open_editor_vault"):
             return open_editor_vault_result(
                 cfg,

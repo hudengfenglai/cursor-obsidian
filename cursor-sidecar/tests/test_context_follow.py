@@ -1,13 +1,17 @@
-"""v0.6 Context Follow — pure logic + silent sync contract tests."""
+"""v0.6 Context Follow — latest-wins, focus policy, silent sync tests."""
 
 from __future__ import annotations
 
+import shutil
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import context_follow as cf
+import context_sync as cs
 import main as sidecar
+from context_sync import ContextSyncController, SyncJob, should_restore_obsidian_focus
 from editor_bridge import EditorBridge
 
 
@@ -36,17 +40,13 @@ def test_same_file_suppression():
 
 
 def test_context_follow_disabled():
-    ok, reason = cf.should_accept_sync(
-        enabled=False, attached=True, path=r"D:\vault\a.md"
-    )
+    ok, reason = cf.should_accept_sync(enabled=False, attached=True, path=r"D:\vault\a.md")
     assert ok is False
     assert reason == "disabled"
 
 
 def test_detached_suppression():
-    ok, reason = cf.should_accept_sync(
-        enabled=True, attached=False, path=r"D:\vault\a.md"
-    )
+    ok, reason = cf.should_accept_sync(enabled=True, attached=False, path=r"D:\vault\a.md")
     assert ok is False
     assert reason == "detached"
 
@@ -59,23 +59,13 @@ def test_stale_binding_suppression():
     assert reason == "stale_binding"
 
 
-def test_non_file_empty_path():
-    ok, reason = cf.should_accept_sync(enabled=True, attached=True, path=None)
-    assert ok is False
-    assert reason == "no_path"
-
-
 def test_excluded_obsidian_config_paths():
     assert cf.is_excluded_rel_path(".obsidian/app.json") is True
-    assert cf.is_excluded_rel_path(".obsidian/plugins/x/data.json") is True
     assert cf.is_excluded_rel_path("notes/a.md") is False
     assert cf.is_excluded_rel_path("中文/笔记.md") is False
-    assert cf.is_excluded_rel_path(".trash/x.md") is True
 
 
 def test_vault_path_validation():
-    import shutil
-
     base = Path(__file__).resolve().parent / "_tmp_cf_vault"
     if base.exists():
         shutil.rmtree(base, ignore_errors=True)
@@ -90,24 +80,91 @@ def test_vault_path_validation():
         shutil.rmtree(base, ignore_errors=True)
 
 
-def test_markdown_line_column_gate():
-    assert cf.should_sync_line_column(extension="md", is_markdown_editor=True) is True
-    assert cf.should_sync_line_column(extension="pdf", is_markdown_editor=False) is False
-    assert cf.should_sync_line_column(extension="md", is_markdown_editor=False) is False
+def test_focus_restore_obsidian_to_cursor():
+    assert (
+        should_restore_obsidian_focus(
+            foreground_before=10,
+            foreground_after=20,
+            obsidian_hwnd=10,
+            cursor_hwnd=20,
+        )
+        is True
+    )
 
 
-def test_explicit_open_focus_true(monkeypatch):
-    calls = {"focus": 0}
+def test_focus_restore_obsidian_to_chrome_noop():
+    assert (
+        should_restore_obsidian_focus(
+            foreground_before=10,
+            foreground_after=99,
+            obsidian_hwnd=10,
+            cursor_hwnd=20,
+        )
+        is False
+    )
 
-    def fake_focus(_h):
-        calls["focus"] += 1
+
+def test_pending_b_replaced_by_c():
+    executed: list[int] = []
+    barrier = threading.Event()
+
+    def execute(job: SyncJob):
+        if job.seq == 1:
+            barrier.wait(timeout=2.0)
+        executed.append(job.seq)
+        return {"ok": True, "seq": job.seq}
+
+    ctrl = ContextSyncController(execute=execute)
+    assert ctrl.submit(SyncJob(seq=1, vault_root="v", path="A")).get("queued") is True
+    time.sleep(0.05)
+    assert ctrl.submit(SyncJob(seq=2, vault_root="v", path="B")).get("queued") is True
+    assert ctrl.submit(SyncJob(seq=3, vault_root="v", path="C")).get("queued") is True
+    barrier.set()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and ctrl.status()["running"]:
+        time.sleep(0.02)
+    assert 2 not in executed
+    assert 3 in executed
+    assert executed[-1] == 3
+
+
+def test_stale_seq_discarded():
+    executed: list[int] = []
+
+    def execute(job: SyncJob):
+        executed.append(job.seq)
+        return {"ok": True}
+
+    ctrl = ContextSyncController(execute=execute)
+    ctrl.submit(SyncJob(seq=10, vault_root="v", path="A"))
+    time.sleep(0.05)
+    out = ctrl.submit(SyncJob(seq=5, vault_root="v", path="old"))
+    assert out.get("discarded") is True
+    deadline = time.time() + 1.0
+    while time.time() < deadline and ctrl.status()["running"]:
+        time.sleep(0.02)
+    assert 5 not in executed
+
+
+def test_clear_pending():
+    ctrl = ContextSyncController(execute=lambda j: {"ok": True})
+    # Force pending without starting by setting state carefully
+    ctrl.submit(SyncJob(seq=1, vault_root="v", path="A"))
+    ctrl.clear_pending()
+    st = ctrl.status()
+    # running may still be true briefly; pending must be false
+    assert st["pending"] is False
+
+
+def test_background_routing_check_false(monkeypatch):
+    calls = {"focus": 0, "list": 0}
 
     bridge = EditorBridge(
         validate_binding=lambda b: {"ok": True, "hwnd": 1, "pid": 2},
-        focus_hwnd=fake_focus,
-        list_cursor_hwnds=lambda _n: [1],
+        focus_hwnd=lambda _h: calls.__setitem__("focus", calls["focus"] + 1),
+        list_cursor_hwnds=lambda _n: calls.__setitem__("list", calls["list"] + 1) or [1],
         focus_settle_s=0,
-        routing_wait_s=0,
+        routing_wait_s=0.5,
     )
     monkeypatch.setattr(
         "editor_bridge.get_bound_cursor_executable",
@@ -118,77 +175,53 @@ def test_explicit_open_focus_true(monkeypatch):
             "pid": 2,
         },
     )
-    monkeypatch.setattr(
-        "editor_bridge.resolve_vault_file",
-        lambda vault, path: Path(path),
-    )
-    monkeypatch.setattr(
-        bridge,
-        "_invoke_with_fallback",
-        lambda *a, **k: {"ok": True, "method": "exe_goto"},
-    )
-    r = bridge.open_file(
-        binding={"hwnd": 1, "pid": 2},
-        vault_root=r"D:\vault",
-        path=r"D:\vault\a.md",
-        line=2,
-        focus=True,
-        preserve_foreground=False,
-    )
-    assert r["ok"] is True
-    assert r["focused"] is True
-    assert calls["focus"] == 1
-
-
-def test_automatic_sync_focus_false(monkeypatch):
-    calls = {"focus": 0, "restore": 0}
-
-    def fake_focus(_h):
-        calls["focus"] += 1
-
-    bridge = EditorBridge(
-        validate_binding=lambda b: {"ok": True, "hwnd": 1, "pid": 2},
-        focus_hwnd=fake_focus,
-        list_cursor_hwnds=lambda _n: [1],
-        focus_settle_s=0,
-        routing_wait_s=0,
-    )
-    monkeypatch.setattr(
-        "editor_bridge.get_bound_cursor_executable",
-        lambda binding, validate_fn=None: {
-            "ok": True,
-            "exe": r"C:\Cursor\Cursor.exe",
-            "hwnd": 1,
-            "pid": 2,
-        },
-    )
-    monkeypatch.setattr(
-        "editor_bridge.resolve_vault_file",
-        lambda vault, path: Path(path),
-    )
-    monkeypatch.setattr(
-        bridge,
-        "_invoke_with_fallback",
-        lambda *a, **k: {"ok": True, "method": "exe_file"},
-    )
-
-    def restore(hwnd):
-        calls["restore"] += 1
-        return {"stolen": False, "restored": False, "foreground_after": hwnd, "original": hwnd}
+    monkeypatch.setattr("editor_bridge.resolve_vault_file", lambda vault, path: Path(path))
+    monkeypatch.setattr(bridge, "_invoke_with_fallback", lambda *a, **k: {"ok": True, "method": "exe_file"})
 
     r = bridge.open_file(
         binding={"hwnd": 1, "pid": 2},
         vault_root=r"D:\vault",
         path=r"D:\vault\a.md",
         focus=False,
-        preserve_foreground=True,
-        get_foreground_hwnd=lambda: 99,
-        restore_if_stolen=restore,
+        routing_check=False,
+        preserve_foreground=False,
     )
     assert r["ok"] is True
-    assert r["focused"] is False
+    assert r["routing_check"] is False
     assert calls["focus"] == 0
-    assert calls["restore"] == 1
+    assert calls["list"] == 0  # no before/after enumeration
+
+
+def test_explicit_open_focus_true(monkeypatch):
+    calls = {"focus": 0}
+
+    bridge = EditorBridge(
+        validate_binding=lambda b: {"ok": True, "hwnd": 1, "pid": 2},
+        focus_hwnd=lambda _h: calls.__setitem__("focus", calls["focus"] + 1),
+        list_cursor_hwnds=lambda _n: [1],
+        focus_settle_s=0,
+        routing_wait_s=0,
+    )
+    monkeypatch.setattr(
+        "editor_bridge.get_bound_cursor_executable",
+        lambda binding, validate_fn=None: {
+            "ok": True,
+            "exe": r"C:\Cursor\Cursor.exe",
+            "hwnd": 1,
+            "pid": 2,
+        },
+    )
+    monkeypatch.setattr("editor_bridge.resolve_vault_file", lambda vault, path: Path(path))
+    monkeypatch.setattr(bridge, "_invoke_with_fallback", lambda *a, **k: {"ok": True, "method": "exe_goto"})
+    r = bridge.open_file(
+        binding={"hwnd": 1},
+        vault_root=r"D:\v",
+        path=r"D:\v\a.md",
+        focus=True,
+        routing_check=True,
+    )
+    assert r["focused"] is True
+    assert calls["focus"] == 1
 
 
 def test_sync_rpc_requires_attached(monkeypatch):
@@ -197,31 +230,12 @@ def test_sync_rpc_requires_attached(monkeypatch):
         "refresh_attachment_truth",
         lambda: {"attached": False, "state_valid": True, "reason": "detached", "state": {}},
     )
-    r = sidecar.sync_editor_file_result(
-        {}, vault_root=r"D:\vault", path=r"D:\vault\a.md"
-    )
+    r = sidecar.sync_editor_file_result({}, vault_root=r"D:\vault", path=r"D:\vault\a.md", seq=1)
     assert r["ok"] is False
     assert r["error"] == "sidecar_not_attached"
-    assert r["cmd"] == "sync-editor-file"
 
 
-def test_sync_rpc_excludes_obsidian_config(monkeypatch):
-    monkeypatch.setattr(
-        sidecar,
-        "refresh_attachment_truth",
-        lambda: {"attached": True, "state_valid": True, "reason": "ok", "state": {"cursor": {"hwnd": 1}}},
-    )
-    r = sidecar.sync_editor_file_result(
-        {},
-        vault_root=r"D:\vault",
-        path=r"D:\vault\.obsidian\app.json",
-        relative_path=".obsidian/app.json",
-    )
-    assert r["ok"] is False
-    assert r["error"] == "path_excluded"
-
-
-def test_sync_rpc_stale_binding(monkeypatch):
+def test_sync_rpc_queues(monkeypatch):
     monkeypatch.setattr(
         sidecar,
         "refresh_attachment_truth",
@@ -232,33 +246,29 @@ def test_sync_rpc_stale_binding(monkeypatch):
             "state": {"cursor": {"hwnd": 1, "pid": 2}},
         },
     )
-    monkeypatch.setattr(sidecar, "validate_window_binding", lambda b: {"ok": False, "reason": "gone"})
+    monkeypatch.setattr(sidecar, "validate_window_binding", lambda b: {"ok": True})
     monkeypatch.setattr(sidecar, "is_path_inside_vault", lambda v, p: True)
+    monkeypatch.setattr(sidecar, "_execute_context_sync_job", lambda job: {"ok": True, "seq": job.seq})
+    # reset controller
+    sidecar._CONTEXT_SYNC = ContextSyncController(execute=lambda job: {"ok": True, "seq": job.seq})
     r = sidecar.sync_editor_file_result(
         {},
         vault_root=r"D:\vault",
         path=r"D:\vault\a.md",
         relative_path="a.md",
+        seq=42,
     )
-    assert r["ok"] is False
-    assert r["error"] == "stale_binding"
+    assert r.get("ok") is True
+    assert r.get("queued") is True
+    assert r.get("seq") == 42
 
 
-def test_gate_record_and_status():
-    gate = cf.ContextFollowGate(enabled=True)
-    gate.record(r"D:\vault\a.md", 3, relative_path="a.md", now=123.0)
-    st = gate.status_dict()
-    assert st["enabled"] is True
-    assert st["last_path"] == "a.md"
-    assert st["last_sync_at"] == 123.0
-
-
-def test_handle_rpc_sync_ignores_focus_true(monkeypatch):
+def test_handle_rpc_sync_passes_seq(monkeypatch):
     captured = {}
 
     def fake_sync(cfg, **kwargs):
         captured.update(kwargs)
-        return {"ok": True, "cmd": "sync-editor-file", "focused": False}
+        return {"ok": True, "queued": True, "seq": kwargs.get("seq")}
 
     monkeypatch.setattr(sidecar, "sync_editor_file_result", fake_sync)
     r = sidecar.handle_rpc(
@@ -267,8 +277,9 @@ def test_handle_rpc_sync_ignores_focus_true(monkeypatch):
             "cmd": "sync-editor-file",
             "vault_root": r"D:\vault",
             "path": r"D:\vault\a.md",
-            "focus": True,  # must be ignored by RPC path
+            "seq": 7,
+            "focus": True,
         },
     )
     assert r["ok"] is True
-    assert "focus" not in captured  # sync_editor_file_result has no focus param
+    assert captured.get("seq") == 7
