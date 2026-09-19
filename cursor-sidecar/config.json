@@ -17,5 +17,6 @@
   "cursor_exe_candidates": [
     "%LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe",
     "%LOCALAPPDATA%\\cursor\\Cursor.exe"
-  ]
+  ],
+  "embed_backend": "native_child"
 }

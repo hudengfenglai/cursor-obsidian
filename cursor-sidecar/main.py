@@ -35,6 +35,7 @@ from cursor_windows import (
     agent_binding_ok,
     agent_hwnd,
     bind_agent_from_hwnd,
+    bind_editor_from_hwnd,
     candidates_excluding_editor,
     clear_agent_binding,
     diff_new_hwnds,
@@ -44,7 +45,11 @@ from cursor_windows import (
     get_editor_binding,
     list_cursor_top_level,
     migrate_cursor_roles,
+    refresh_cursor_bindings,
+    select_editor_window,
 )
+from cursor_exe import resolve_cursor_executable
+from agents_auto import ensure_agents_window_bound
 from embedded_window import (
     apply_borderless,
     apply_embedded_pane,
@@ -59,7 +64,6 @@ from native_embed import (
     recover_native_child,
     update_native_child,
 )
-from agents_auto import ensure_agents_window_bound
 from pane_geometry import DomPaneRect
 from runtime_paths import (
     DEFAULT_CONFIG_VALUES,
@@ -664,7 +668,17 @@ def ensure_cursor(
     file_path: str | None = None,
 ) -> None:
     proc = cfg["cursor_process"]
-    exe = resolve_cursor_exe(cfg.get("cursor_exe_candidates", []))
+    state = read_state()
+    migrate_cursor_roles(state)
+    refresh_cursor_bindings(state)
+    resolved = resolve_cursor_executable(
+        cfg,
+        binding=get_editor_binding(state) or state.get("cursor"),
+        persist=True,
+    )
+    exe = resolved.get("path") if resolved.get("ok") else None
+    if exe:
+        cfg["cursor_exe_verified"] = exe
     args: list[str] = []
     if file_path:
         args.append(file_path)
@@ -680,15 +694,24 @@ def ensure_cursor(
     if not cfg["launch_cursor_if_missing"]:
         raise RuntimeError(f"{proc} is not running and launch_cursor_if_missing=false")
     if not exe:
-        raise RuntimeError("Cursor.exe not found. Add path to config.cursor_exe_candidates")
+        raise RuntimeError(
+            "Cursor.exe not found. Set path in settings (Advanced) or config.cursor_exe_verified"
+        )
     print(f"[sidecar] launching {exe}" + (f" {' '.join(args)}" if args else ""))
     launch_process(exe, args=args or None)
-    found = wait_for_window(
-        lambda: find_cursor_window(proc, cfg.get("cursor_title_hint", "")),
-        timeout_s=45.0,
-    )
+
+    def _find_editor():
+        sel = select_editor_window(proc)
+        if not sel.get("ok"):
+            return None
+        w = sel["window"]
+        from window import window_info_from_hwnd
+
+        return window_info_from_hwnd(int(w["hwnd"]))
+
+    found = wait_for_window(_find_editor, timeout_s=45.0)
     if not found:
-        raise RuntimeError("Cursor launched but window not found in time")
+        raise RuntimeError("Cursor launched but Editor window not classified in time")
 
 
 def _monitor_arg(cfg: dict[str, Any]) -> int | None:
@@ -726,6 +749,9 @@ def cmd_attach(
 
         truth = refresh_attachment_truth()
         state = truth["state"]
+        migrate_cursor_roles(state)
+        refresh_cursor_bindings(state)
+        write_state(state)
 
         if truth["attached"]:
             obs_b = resolve_bound_window(
@@ -733,12 +759,12 @@ def cmd_attach(
                 cfg["obsidian_process"],
                 cfg.get("obsidian_title_hint", ""),
             )
-            cur_b = resolve_bound_window(
-                state.get("cursor"),
-                cfg["cursor_process"],
-                cfg.get("cursor_title_hint", ""),
-                allow_hidden=True,
-            )
+            # Prefer live editor binding — never rediscover via largest window
+            cur_b = None
+            if editor_binding_ok(state).get("ok"):
+                from window import window_info_from_hwnd
+
+                cur_b = window_info_from_hwnd(editor_hwnd(state))
             if obs_b and cur_b:
                 left, right = arrange_bound_windows(
                     obs_b,
@@ -762,22 +788,38 @@ def cmd_attach(
                 print("[sidecar] attach (idempotent rearrange)")
                 return 0
 
-        cur = resolve_bound_window(
-            state.get("cursor") if binding_live(state.get("cursor")) else None,
-            cfg["cursor_process"],
-            cfg.get("cursor_title_hint", ""),
-            allow_hidden=True,
-        )
+        # Fresh editor selection: EDITOR only (Agents never bind as editor)
+        sel = select_editor_window(cfg["cursor_process"])
+        if not sel.get("ok"):
+            # Wait briefly for Editor if only Agents present / still launching
+            def _wait_editor():
+                s2 = select_editor_window(cfg["cursor_process"])
+                return s2 if s2.get("ok") else None
+
+            waited = wait_for_window(_wait_editor, timeout_s=8.0, poll_s=0.35)
+            if waited and waited.get("ok"):
+                sel = waited
+            else:
+                err = sel.get("error") or "editor_window_not_found"
+                print(f"[sidecar] Cursor Editor not found ({err})")
+                if err == "editor_window_ambiguous":
+                    print("[sidecar] multiple Editor candidates — refusing to guess")
+                return 1
+
+        from window import window_info_from_hwnd
+
+        cur = window_info_from_hwnd(int(sel["window"]["hwnd"]))
         if not cur:
-            cur = find_cursor_window(cfg["cursor_process"], cfg.get("cursor_title_hint", ""))
-        if not cur:
-            print("[sidecar] Cursor window not found")
+            print("[sidecar] Cursor Editor hwnd invalid")
+            return 1
+        # Double-check bind refuses AGENT
+        cur_snap = bind_editor_from_hwnd(cur.hwnd, process_name=cfg["cursor_process"])
+        if not cur_snap:
+            print("[sidecar] refused to bind Agents Window as Editor")
             return 1
 
         obs_snap = snapshot_window(obs.hwnd)
-        cur_snap = snapshot_window(cur.hwnd)
         obs_snap["process"] = cfg["obsidian_process"]
-        cur_snap["process"] = cfg["cursor_process"]
 
         left, right = arrange_bound_windows(
             obs,
@@ -789,6 +831,8 @@ def cmd_attach(
         )
 
         prev = read_state()
+        migrate_cursor_roles(prev)
+        refresh_cursor_bindings(prev)
         prev_agent = prev.get("cursor_agent") if isinstance(prev.get("cursor_agent"), dict) else None
 
         new_state = {
@@ -815,7 +859,7 @@ def cmd_attach(
         print(
             f"[sidecar] attached\n"
             f"  Obsidian hwnd={obs.hwnd} pid={obs.pid}\n"
-            f"  Cursor   hwnd={cur.hwnd} pid={cur.pid}\n"
+            f"  Cursor Editor hwnd={cur.hwnd} pid={cur.pid}\n"
             f"  preset={cfg.get('preset')} L={left.as_tuple()} R={right.as_tuple()}"
         )
         return 0
@@ -1335,10 +1379,14 @@ def cmd_open_editor_vault(
 def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
     truth = refresh_attachment_truth()
     state = truth["state"]
+    migrate_cursor_roles(state)
+    refresh = refresh_cursor_bindings(state)
+    if refresh.get("cleared_editor") or refresh.get("cleared_agent"):
+        write_state(state)
     obs_rep = binding_report(state.get("obsidian"))
-    cur_rep = binding_report(state.get("cursor"))
+    cur_rep = binding_report(state.get("cursor_editor") or state.get("cursor"))
     obs_live = bool(obs_rep.get("ok"))
-    cur_live = bool(cur_rep.get("ok"))
+    cur_live = bool(cur_rep.get("ok")) and bool(refresh.get("editor_ok"))
 
     legacy = bool(obs_rep.get("legacy_binding") or cur_rep.get("legacy_binding"))
     # Prefer cursor binding mode when attached; else best available
@@ -1450,8 +1498,9 @@ def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
         "cursor_agent": {
             "ok": bool(agent_binding_ok(state).get("ok")),
             "hwnd": agent_hwnd(state) or None,
-            "bound": bool(get_agent_binding(state)),
+            "bound": bool(agent_binding_ok(state).get("ok")),
         },
+        "bindings_refresh": refresh,
         "obsidian_binding": {
             "ok": obs_live,
             "legacy_binding": bool(obs_rep.get("legacy_binding")),
@@ -1470,6 +1519,51 @@ def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
         "left_rect": state.get("left_rect"),
         "right_rect": state.get("right_rect"),
     }
+
+
+def build_runtime_info(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Canonical runtime identity — never includes token content."""
+    paths = get_paths()
+    cfg = cfg or {}
+    host = str(cfg.get("daemon_host") or "127.0.0.1")
+    port = int(cfg.get("daemon_port") or 27845)
+    daemon_running = False
+    try:
+        meta_path = paths.daemon_meta_path
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            pid = int(meta.get("pid") or 0)
+            if pid and psutil.pid_exists(pid):
+                daemon_running = True
+    except Exception:
+        daemon_running = False
+    return {
+        "ok": True,
+        "version": VERSION,
+        "runtime_mode": runtime_mode(),
+        "binary_path": str(paths.helper_executable),
+        "code_dir": str(paths.code_dir),
+        "data_dir": str(paths.data_dir),
+        "config_path": str(paths.config_path),
+        "state_path": str(paths.state_path),
+        "daemon_meta_path": str(paths.daemon_meta_path),
+        "daemon_token_path": str(paths.daemon_token_path),
+        "daemon_pid_path": str(paths.daemon_pid_path),
+        "daemon_running": daemon_running,
+        "daemon_host": host,
+        "daemon_port": port,
+        "cursor_exe_verified": cfg.get("cursor_exe_verified"),
+    }
+
+
+def cmd_runtime_info(cfg: dict[str, Any], as_json: bool = True, **_: Any) -> int:
+    payload = build_runtime_info(cfg)
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        for k, v in payload.items():
+            print(f"  {k}: {v}")
+    return 0
 
 
 def cmd_status(cfg: dict[str, Any], as_json: bool = False, **_: Any) -> int:
@@ -1508,11 +1602,15 @@ def _obsidian_hwnd(state: dict[str, Any]) -> int:
 def build_embedded_status(state: dict[str, Any] | None = None) -> dict[str, Any]:
     st = state if state is not None else read_state()
     migrate_cursor_roles(st)
+    refresh = refresh_cursor_bindings(st)
+    if refresh.get("cleared_editor") or refresh.get("cleared_agent"):
+        write_state(st)
     ag = get_agent_binding(st)
     oh = _obsidian_hwnd(st)
     ah = agent_hwnd(st)
     claimed_backend = st.get("embed_backend") or "visual"
     claimed_native = bool(st.get("native_child"))
+    agent_live_ok = bool(refresh.get("agent_ok"))
 
     live: dict[str, Any] = {}
     verified = False
@@ -1526,14 +1624,14 @@ def build_embedded_status(state: dict[str, Any] | None = None) -> dict[str, Any]
     # Hard rule: native_child=true ONLY when Win32 verifies
     out: dict[str, Any] = {
         "mode": st.get("embed_mode") or "sidecar",
-        "embedded": bool(st.get("embedded")),
+        "embedded": bool(st.get("embedded")) and agent_live_ok,
         "embed_backend": claimed_backend,
         "backend": claimed_backend,
         "native_child": bool(verified),  # live only
         "native_child_claimed": claimed_native,
         "is_native_child": bool(verified),
         "target": "agent",
-        "agent_bound": bool(ag),
+        "agent_bound": agent_live_ok,  # live validate only
         "obsidian_hwnd": oh or None,
         "agent_hwnd": ah or None,
         "editor_hwnd": editor_hwnd(st) or None,
@@ -1545,6 +1643,7 @@ def build_embedded_status(state: dict[str, Any] | None = None) -> dict[str, Any]
         "WS_THICKFRAME": live.get("WS_THICKFRAME"),
         "agent_style": live.get("style"),
         "style_after": live.get("style"),
+        "refresh": refresh,
         "obsidian_dpi": None,
         "agent_dpi": live.get("dpi"),
         "visible": None,
@@ -1700,6 +1799,8 @@ def enter_embedded_pane(cfg: dict[str, Any], pane: dict[str, Any]) -> dict[str, 
             return {"ok": False, "error": "sidecar_not_attached"}
         state = truth["state"]
         migrate_cursor_roles(state)
+        refresh_cursor_bindings(state)
+        write_state(state)
         obs_hwnd = _obsidian_hwnd(state)
         if not obs_hwnd or not validate_window_binding(state.get("obsidian")).get("ok"):
             return {"ok": False, "error": "stale_binding", "which": "obsidian"}
@@ -2291,6 +2392,15 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
             if "backend" not in body and "embed_backend" not in body:
                 return {"ok": False, "error": "backend required"}
             return set_embed_backend(cfg, str(body.get("backend") or body.get("embed_backend")))
+        elif cmd in ("set-cursor-exe", "set_cursor_exe"):
+            path = str(body.get("path") or body.get("cursor_exe") or "").strip()
+            if not path:
+                return {"ok": False, "error": "path required"}
+            update_config_file({"cursor_exe_verified": path, "cursor_exe_candidates": [path]})
+            cfg["cursor_exe_verified"] = path
+            return {"ok": True, "cmd": "set-cursor-exe", "path": path}
+        elif cmd in ("runtime-info", "runtime_info"):
+            return build_runtime_info(cfg)
         elif cmd == "status":
             return {"ok": True, "cmd": cmd, "status": build_status(cfg)}
         else:
@@ -2556,6 +2666,8 @@ def build_parser() -> argparse.ArgumentParser:
     oev.add_argument("--no-focus", action="store_true")
     status_p = sub.add_parser("status", help="Attachment + window status")
     status_p.add_argument("--json", action="store_true")
+    ri = sub.add_parser("runtime-info", help="Print canonical runtime paths (no token)")
+    ri.add_argument("--json", action="store_true", default=True)
     sub.add_parser("stop", help="Stop follow/daemon pids")
     daemon_p = sub.add_parser("daemon", help="Foreground daemon (HTTP + Live Follow)")
     daemon_p.add_argument("--host", default=None, help="Bind host (localhost only)")
@@ -2599,6 +2711,9 @@ def main(argv: list[str] | None = None) -> int:
 
     aliases = {"dock": "attach", "undock": "detach", "restore": "detach"}
     command = aliases.get(args.command, args.command)
+
+    if command == "runtime-info":
+        return cmd_runtime_info(cfg, as_json=True)
 
     if command != "status":
         print(f"[sidecar] dpi={dpi}")

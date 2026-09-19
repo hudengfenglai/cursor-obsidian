@@ -141,9 +141,9 @@ def test_config_bootstrap_merges_disk_over_defaults(monkeypatch):
 
 def test_version_cli(capsys):
     assert sidecar_main.main(["--version"]) == 0
-    assert capsys.readouterr().out.strip() == "0.7.1-dev"
+    assert capsys.readouterr().out.strip() == "0.7.2-dev"
     assert sidecar_main.main(["version"]) == 0
-    assert capsys.readouterr().out.strip() == "0.7.1-dev"
+    assert capsys.readouterr().out.strip() == "0.7.2-dev"
 
 
 def test_frozen_mode_does_not_use_repo_root_for_state(monkeypatch):
@@ -275,6 +275,6 @@ def test_write_daemon_meta_includes_runtime_fields(monkeypatch):
         assert data["runtime_mode"] == "source"
         assert data["executable_path"].endswith("python.exe")
         assert data["entrypoint"] == "main.py"
-        assert data["version"] == "0.7.1-dev"
+        assert data["version"] == "0.7.2-dev"
     finally:
         shutil.rmtree(base, ignore_errors=True)

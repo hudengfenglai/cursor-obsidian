@@ -11,7 +11,7 @@ $BuildDir = Join-Path $RepoRoot "build"
 $ReleaseRoot = Join-Path $RepoRoot "release\cursor-sidecar"
 $Venv = Join-Path $RepoRoot ".packaging-venv"
 $Spec = Join-Path $PSScriptRoot "cursor-sidecar.spec"
-$Version = "0.7.1-dev"
+$Version = "0.7.2-dev"
 $ZipName = "cursor-sidecar-v$Version-windows-x64.zip"
 $ZipPath = Join-Path $RepoRoot "release\$ZipName"
 

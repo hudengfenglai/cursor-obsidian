@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "0.7.1-dev"
+VERSION = "0.7.2-dev"
 
 DEFAULT_CONFIG_VALUES: dict[str, Any] = {
     "preset": "normal",
@@ -36,8 +36,11 @@ DEFAULT_CONFIG_VALUES: dict[str, Any] = {
     "embed_backend": "visual",
     "cursor_exe_candidates": [
         r"%LOCALAPPDATA%\Programs\cursor\Cursor.exe",
+        r"%LOCALAPPDATA%\Programs\Cursor\Cursor.exe",
         r"%LOCALAPPDATA%\cursor\Cursor.exe",
+        r"C:\Program Files\Cursor\Cursor.exe",
     ],
+    "cursor_exe_verified": None,
 }
 
 

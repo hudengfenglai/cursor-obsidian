@@ -25,7 +25,8 @@ const DEFAULT_SETTINGS = {
   showNotices: true,
   embeddedPaneExperimental: true,
   borderlessCursorExperimental: false,
-  embedBackend: "native_child", // "visual" | "native_child" — v0.7.1 defaults native
+  embedBackend: "native_child", // "visual" | "native_child"
+  cursorExePath: "", // Advanced: optional Cursor.exe override
 };
 
 const CONTEXT_FOLLOW_DEBOUNCE_MS = 150;
@@ -255,6 +256,8 @@ class CursorSidecarPlugin extends Plugin {
     this._embeddedPaneView = null;
     this._embedActive = false;
     this._nativeVerified = false;
+    this._commandBusy = false;
+    this._runtimeInfo = null;
     this._paneRaf = null;
     this._paneLastSentAt = 0;
     this._paneThrottleTimer = null;
@@ -552,13 +555,15 @@ class CursorSidecarPlugin extends Plugin {
       }
       const st = await this.httpJson("GET", "/status");
       const status = (st && st.status) || st || {};
-      const agent = status.cursor_agent || (status.embedded && status.embedded) || {};
+      const agent = status.cursor_agent || {};
       const emb = status.embedded || {};
+      // Live truth only — never trust stale agent_bound memory alone
+      const liveBound = !!(agent.ok || agent.bound || emb.agent_bound);
       if (emb.agent_stale_reason || status.agent_stale_reason) {
         view.renderPaneUi("closed");
         return;
       }
-      if (agent.bound || agent.ok || emb.agent_bound) {
+      if (liveBound) {
         view.renderPaneUi("ready");
       } else {
         view.renderPaneUi("unbound");
@@ -1005,6 +1010,9 @@ class CursorSidecarPlugin extends Plugin {
   }
 
   resolveDataDir() {
+    if (this._runtimeInfo && this._runtimeInfo.data_dir) {
+      return String(this._runtimeInfo.data_dir);
+    }
     const override = (this.settings.dataDirOverride || "").trim();
     if (override) return override;
     const envOverride = (process.env.CURSOR_SIDECAR_DATA_DIR || "").trim();
@@ -1367,6 +1375,26 @@ class CursorSidecarPlugin extends Plugin {
     }
   }
 
+  async ensureRuntimeInfo({ force = false } = {}) {
+    if (this._runtimeInfo && !force) return this._runtimeInfo;
+    if (!this.helperConfigured()) return null;
+    try {
+      const result = await this.runHelper(["runtime-info", "--json"]);
+      const out = (result.stdout || "").trim();
+      const line = out.split(/\r?\n/).filter(Boolean).pop() || "";
+      const info = JSON.parse(line);
+      if (info && info.data_dir) {
+        this._runtimeInfo = info;
+        if (info.daemon_host) this.settings.daemonHost = String(info.daemon_host);
+        if (info.daemon_port) this.settings.daemonPort = Number(info.daemon_port) || this.settings.daemonPort;
+        return info;
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    return null;
+  }
+
   helperFrontArgs() {
     const dataDir = this.resolveDataDir();
     const args = [];
@@ -1376,15 +1404,47 @@ class CursorSidecarPlugin extends Plugin {
     return args;
   }
 
+  async withCommandLifecycle(label, fn, { timeoutMs = 15000 } = {}) {
+    if (this._commandBusy) {
+      this.notify("Cursor Sidecar: busy — wait for previous command", true);
+      return null;
+    }
+    this._commandBusy = true;
+    const notice = this.settings.showNotices ? new Notice(`Cursor Sidecar: ${label}…`, 0) : null;
+    let timer = null;
+    try {
+      const work = Promise.resolve().then(() => fn());
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
+      });
+      const result = await Promise.race([work, timeout]);
+      if (notice) notice.hide();
+      return result;
+    } catch (err) {
+      if (notice) notice.hide();
+      this.notify(`Cursor Sidecar: ${label} failed — ${err.message || err}`, true);
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this._commandBusy = false;
+    }
+  }
+
   async ensureDaemon() {
     if (await this.daemonHealthy()) return true;
     if (!this.helperConfigured()) return false;
+    await this.ensureRuntimeInfo({ force: !this._runtimeInfo });
     const host = this.settings.daemonHost || "127.0.0.1";
     const port = String(Number(this.settings.daemonPort) || 27845);
-    await this.runHelper(["daemon-start", "--host", host, "--port", port]);
-    for (let i = 0; i < 15; i++) {
-      await sleep(250);
-      if (await this.daemonHealthy()) return true;
+    const deadline = Date.now() + 15000;
+    try {
+      await this.runHelper(["daemon-start", "--host", host, "--port", port]);
+      while (Date.now() < deadline) {
+        await sleep(250);
+        if (await this.daemonHealthy()) return true;
+      }
+    } catch (_e) {
+      return false;
     }
     return false;
   }
@@ -1501,8 +1561,8 @@ class CursorSidecarPlugin extends Plugin {
 
   async runAction(cmd, showRaw = false) {
     if (!this.helperConfigured()) return null;
-    this.notify(`Cursor Sidecar: ${cmd}…`);
-    try {
+    return await this.withCommandLifecycle(cmd, async () => {
+      await this.ensureRuntimeInfo();
       if (this.settings.liveSidecar) {
         const up = await this.ensureDaemon();
         if (up) {
@@ -1535,10 +1595,7 @@ class CursorSidecarPlugin extends Plugin {
         this.notify("Cursor Sidecar: daemon unavailable — falling back to one-shot CLI", true);
       }
       return await this.runHelperCommand(cmd, showRaw);
-    } catch (err) {
-      this.notify(`Cursor Sidecar error: ${err.message || err}`, true);
-      return null;
-    }
+    }, { timeoutMs: 20000 });
   }
 
   async runHelper(args) {
@@ -1626,7 +1683,7 @@ class CursorSidecarSettingTab extends PluginSettingTab {
       text: `Binary: ${helper.mode === "packaged" && helper.binaryFound ? "Found" : helper.mode === "packaged" ? "Missing" : "n/a (source)"}`,
     });
     status.createEl("p", {
-      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.7.1-dev"}`,
+      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.7.2-dev"}`,
     });
     const daemonLine = status.createEl("p", { text: "Daemon: …" });
     this.plugin
@@ -1796,6 +1853,30 @@ class CursorSidecarSettingTab extends PluginSettingTab {
             const n = Number(value);
             this.plugin.settings.daemonPort = Number.isFinite(n) && n > 0 ? n : 27845;
             await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Cursor executable path")
+      .setDesc("Optional. Custom Cursor.exe (e.g. E:\\cursor\\Cursor.exe). Auto-discovered when possible.")
+      .addText((text) =>
+        text
+          .setPlaceholder("E:\\cursor\\Cursor.exe")
+          .setValue(this.plugin.settings.cursorExePath || "")
+          .onChange(async (value) => {
+            this.plugin.settings.cursorExePath = value.trim();
+            await this.plugin.saveSettings();
+            try {
+              await this.plugin.ensureRuntimeInfo();
+              if (await this.plugin.daemonHealthy()) {
+                await this.plugin.httpJson("POST", "/rpc", {
+                  cmd: "set-cursor-exe",
+                  path: this.plugin.settings.cursorExePath,
+                });
+              }
+            } catch (_e) {
+              /* ignore */
+            }
           })
       );
 

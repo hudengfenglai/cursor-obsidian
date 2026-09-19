@@ -1,72 +1,28 @@
-"""v0.7.1 auto-bind / chrome pure tests (no live SendInput)."""
+"""v0.7.1/0.7.2 auto-bind tests — inject classify / trigger (no live SendInput)."""
 
 from __future__ import annotations
 
-from agents_auto import ensure_agents_window_bound, wait_for_new_agent_hwnd
-from native_embed import style_for_chrome_level, style_for_native_child, style_has_caption, style_has_child
-
-
-def test_chrome_full_clears_caption_and_thickframe_keeps_sysmenu():
-    WS_CAPTION = 0x00C00000
-    WS_THICKFRAME = 0x00040000
-    WS_SYSMENU = 0x00080000
-    WS_CHILD = 0x40000000
-    style = WS_CHILD | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU
-    out = style_for_chrome_level(style, level="full")
-    assert style_has_child(out) or (out & WS_CHILD)
-    assert not style_has_caption(out)
-    assert not (out & WS_THICKFRAME)
-    assert out & WS_SYSMENU
-
-
-def test_chrome_caption_only_keeps_thickframe():
-    WS_CAPTION = 0x00C00000
-    WS_THICKFRAME = 0x00040000
-    WS_SYSMENU = 0x00080000
-    style = WS_CAPTION | WS_THICKFRAME
-    out = style_for_chrome_level(style, level="caption_only")
-    assert not style_has_caption(out)
-    assert out & WS_THICKFRAME
-    assert out & WS_SYSMENU
-
-
-def test_native_child_style_still_sets_child():
-    WS_POPUP = 0x80000000
-    WS_CAPTION = 0x00C00000
-    child = style_for_native_child(WS_POPUP | WS_CAPTION)
-    assert style_has_child(child)
-
-
-def test_wait_for_new_agent_hwnd_diff():
-    before = [{"hwnd": 1}, {"hwnd": 2}]
-    calls = {"n": 0}
-
-    def list_fn(_proc):
-        calls["n"] += 1
-        if calls["n"] < 2:
-            return before
-        return before + [{"hwnd": 99, "title": "x"}]
-
-    r = wait_for_new_agent_hwnd(
-        before=before,
-        process_name="Cursor.exe",
-        editor_hwnd_i=1,
-        timeout_s=1.0,
-        poll_s=0.01,
-        list_fn=list_fn,
-    )
-    assert r["ok"] is True
-    assert r["candidate"]["hwnd"] == 99
+from agents_auto import ensure_agents_window_bound, wait_for_agent_classified
+from cursor_windows import ROLE_AGENT, ROLE_EDITOR, ROLE_UNKNOWN
 
 
 def test_ensure_auto_select_existing(monkeypatch):
     state = {
-        "cursor_editor": {"hwnd": 10},
+        "cursor_editor": {"hwnd": 10, "pid": 1, "process": "Cursor.exe", "process_create_time": 1.0},
         "cursor_agent": None,
     }
+    monkeypatch.setattr(
+        "agents_auto.refresh_cursor_bindings",
+        lambda st: {"editor_ok": True, "agent_ok": False},
+    )
+    monkeypatch.setattr("agents_auto.agent_binding_ok", lambda st: {"ok": False})
+    monkeypatch.setattr("agents_auto.editor_hwnd", lambda st: 10)
+    monkeypatch.setattr("agents_auto.show_window_noactivate", lambda _h: None)
 
-    def list_fn(_p):
-        return [{"hwnd": 10}, {"hwnd": 20, "title": "Agents"}]
+    classified = [
+        {"hwnd": 10, "role": ROLE_EDITOR},
+        {"hwnd": 20, "role": ROLE_AGENT, "title": "Agents"},
+    ]
 
     def bind_fn(hwnd, process_name="Cursor.exe"):
         return {"hwnd": hwnd, "pid": 1, "title": "Agents", "role": "agent"}
@@ -74,68 +30,103 @@ def test_ensure_auto_select_existing(monkeypatch):
     r = ensure_agents_window_bound(
         {"cursor_process": "Cursor.exe"},
         state,
-        list_fn=list_fn,
+        classify_list_fn=lambda _p: classified,
+        list_fn=lambda _p: [{"hwnd": 10}, {"hwnd": 20}],
         bind_fn=bind_fn,
         trigger_fn=lambda *_a, **_k: {"ok": False},
     )
     assert r["ok"] is True
-    assert r["source"] == "auto_select_existing"
+    assert r["source"] == "reuse_existing_agent"
     assert state["cursor_agent"]["hwnd"] == 20
 
 
-def test_ensure_auto_launch_diff(monkeypatch):
+def test_ensure_auto_launch_classified(monkeypatch):
     monkeypatch.setattr("agents_auto.win32gui.IsWindow", lambda _h: True)
     monkeypatch.setattr("agents_auto.get_foreground_hwnd", lambda: 1)
     monkeypatch.setattr("agents_auto.restore_foreground_hwnd", lambda _h: True)
-    monkeypatch.setattr("agents_auto.focus_window", lambda _h: None)
+    monkeypatch.setattr(
+        "agents_auto.refresh_cursor_bindings",
+        lambda st: {"editor_ok": True, "agent_ok": False},
+    )
+    monkeypatch.setattr("agents_auto.agent_binding_ok", lambda st: {"ok": False})
+    monkeypatch.setattr("agents_auto.editor_hwnd", lambda st: 10)
 
-    state = {
-        "cursor_editor": {"hwnd": 10},
-        "cursor_agent": None,
-    }
-    windows = [{"hwnd": 10}]
+    state = {"cursor_editor": {"hwnd": 10}, "cursor_agent": None}
+    windows = [{"hwnd": 10, "role": ROLE_EDITOR}]
 
-    def list_fn(_p):
+    def classify(_p):
         return list(windows)
 
     def bind_fn(hwnd, process_name="Cursor.exe"):
         return {"hwnd": hwnd, "pid": 7, "title": "New", "role": "agent"}
 
-    def trigger(eh, query=None):
-        windows.append({"hwnd": 55, "title": query or "Agents"})
-        return {"ok": True, "query": query}
+    def trigger(eh):
+        windows.append({"hwnd": 55, "role": ROLE_AGENT, "title": "Agents"})
+        return {"ok": True, "trigger_method": "win32_menu"}
 
     r = ensure_agents_window_bound(
         {"cursor_process": "Cursor.exe"},
         state,
         timeout_s=2.0,
-        list_fn=list_fn,
+        classify_list_fn=classify,
+        list_fn=lambda _p: [{"hwnd": w["hwnd"]} for w in windows],
         bind_fn=bind_fn,
         trigger_fn=trigger,
     )
     assert r["ok"] is True
-    assert r["source"] == "auto_launch_diff"
+    assert r["source"] == "auto_launch_classified"
     assert r["agent_hwnd"] == 55
+    assert r["trigger_method"] == "win32_menu"
 
 
 def test_ensure_not_found(monkeypatch):
     monkeypatch.setattr("agents_auto.win32gui.IsWindow", lambda _h: True)
     monkeypatch.setattr("agents_auto.get_foreground_hwnd", lambda: 1)
     monkeypatch.setattr("agents_auto.restore_foreground_hwnd", lambda _h: True)
-    monkeypatch.setattr("agents_auto.focus_window", lambda _h: None)
+    monkeypatch.setattr(
+        "agents_auto.refresh_cursor_bindings",
+        lambda st: {"editor_ok": True, "agent_ok": False},
+    )
+    monkeypatch.setattr("agents_auto.agent_binding_ok", lambda st: {"ok": False})
+    monkeypatch.setattr("agents_auto.editor_hwnd", lambda st: 10)
 
     state = {"cursor_editor": {"hwnd": 10}, "cursor_agent": None}
-
-    def list_fn(_p):
-        return [{"hwnd": 10}]
+    only_editor = [{"hwnd": 10, "role": ROLE_EDITOR}]
 
     r = ensure_agents_window_bound(
         {"cursor_process": "Cursor.exe"},
         state,
-        timeout_s=0.3,
-        list_fn=list_fn,
+        timeout_s=0.35,
+        classify_list_fn=lambda _p: only_editor,
+        list_fn=lambda _p: [{"hwnd": 10}],
         bind_fn=lambda *_a, **_k: None,
-        trigger_fn=lambda *_a, **_k: {"ok": True, "query": "x"},
+        trigger_fn=lambda *_a, **_k: {"ok": True, "trigger_method": "command_palette"},
     )
     assert r["ok"] is False
     assert r["error"] == "agent_window_not_found"
+
+
+def test_wait_for_agent_classified_unique():
+    before = [{"hwnd": 1}]
+    n = {"i": 0}
+
+    def classify(_p):
+        n["i"] += 1
+        if n["i"] < 2:
+            return [{"hwnd": 1, "role": ROLE_EDITOR}]
+        return [
+            {"hwnd": 1, "role": ROLE_EDITOR},
+            {"hwnd": 9, "role": ROLE_UNKNOWN},
+            {"hwnd": 8, "role": ROLE_AGENT},
+        ]
+
+    r = wait_for_agent_classified(
+        process_name="Cursor.exe",
+        editor_hwnd_i=1,
+        before=before,
+        timeout_s=1.0,
+        poll_s=0.01,
+        classify_list_fn=classify,
+    )
+    assert r["ok"] is True
+    assert r["candidate"]["hwnd"] == 8

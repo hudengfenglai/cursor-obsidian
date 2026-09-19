@@ -109,7 +109,7 @@ def main() -> int:
     try:
         # A. --version
         ver = run_exe(exe, data_a, "--version")
-        if ver.returncode == 0 and ver.stdout.strip() == "0.7.1-dev":
+        if ver.returncode == 0 and ver.stdout.strip() == "0.7.2-dev":
             record("A.version", True, ver.stdout.strip())
         else:
             record("A.version", False, ver.stdout.strip())
