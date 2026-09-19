@@ -1,8 +1,13 @@
 """Windows acceptance for v0.6 Context Follow (self-restoring).
 
-Exercises silent sync-editor-file while preserving Obsidian foreground.
-Does not drive the Obsidian plugin event loop (that is covered by unit logic);
-daemon+bridge behavior is validated here.
+Validates daemon + ContextSyncController + EditorBridge behavior:
+  sync-editor-file, latest-wins seq, focus preservation, detach.
+
+Does NOT drive the Obsidian plugin event loop (file-open / JS debounce).
+Real plugin UX (file-open → debounce → RPC) requires manual acceptance:
+
+  Context Follow ON → A→B→C → rapid A→B→C → reload plugin → open D
+  → OFF → open E; foreground stays Obsidian throughout.
 """
 
 from __future__ import annotations

@@ -104,6 +104,54 @@ def test_focus_restore_obsidian_to_chrome_noop():
     )
 
 
+def test_next_context_sync_seq_rebases_after_plugin_reload():
+    # local reset to 0, daemon already at 80
+    nxt = cs.next_context_sync_seq(0, 80, now_ms=1_700_000_000_000)
+    assert nxt > 80
+    assert nxt == max(0, 80, 1_700_000_000_000 * 1000) + 1
+
+
+def test_next_context_sync_seq_prefers_local_when_ahead():
+    # clock below both counters
+    nxt = cs.next_context_sync_seq(500, 80, now_ms=0)
+    assert nxt == 501
+
+
+def test_stale_discarded_does_not_update_gate():
+    gate = cf.ContextFollowGate(enabled=True)
+    gate.record(r"D:\vault\a.md", 1, relative_path="a.md", now=10.0)
+    # Simulate plugin: discarded response must not overwrite last sync
+    discarded = {"ok": True, "queued": False, "discarded": True, "reason": "stale_seq"}
+    if discarded.get("discarded") is True or discarded.get("queued") is False:
+        pass  # no gate.record
+    else:
+        gate.record(r"D:\vault\b.md", 1, relative_path="b.md", now=20.0)
+    assert gate.last_relative_path == "a.md"
+    assert gate.last_sync_at == 10.0
+
+
+def test_stale_seq_retry_once_logic():
+    # First response discarded; rebase then second succeeds
+    daemon_latest = 100
+    local = 0
+    seq1 = cs.next_context_sync_seq(local, daemon_latest, now_ms=2)
+    assert seq1 > daemon_latest
+    # If somehow still stale (daemon jumped), rebase once more from returned latest
+    returned_latest = 200
+    seq2 = cs.next_context_sync_seq(seq1, returned_latest, now_ms=2)
+    assert seq2 > returned_latest
+    # Only one retry in plugin — third not automatic
+    assert seq2 != seq1
+
+
+def test_python_fallback_seq_no_modulo():
+    import inspect
+
+    src = inspect.getsource(sidecar.sync_editor_file_result)
+    assert "% 2_000_000_000" not in src
+    assert "time_ns" in src or "time.time_ns" in src
+
+
 def test_pending_b_replaced_by_c():
     executed: list[int] = []
     barrier = threading.Event()

@@ -1,2 +1,2 @@
-23bd12cbfb5f75045d4cb6abcdd9bde23ec3c301e3e39ff8c0958adce93b6cc6  cursor-sidecar.exe
-a6d06ed27137c5f77c08aaca83a9d0f36f05e301e29a2b9f4973097b69d2db6d  cursor-sidecar-v0.6.0-windows-x64.zip
+eb8f3348868a51eb8dbcb17d0de8cf11e0759d89d083102b2619cb8978c8a95c  cursor-sidecar.exe
+9ae69e20d2886eeff9c39349f526c9c7e1cf8f276a0fb224d67705325dbb9c0b  cursor-sidecar-v0.6.0-windows-x64.zip

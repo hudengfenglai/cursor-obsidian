@@ -27,6 +27,15 @@ const DEFAULT_SETTINGS = {
 const CONTEXT_FOLLOW_DEBOUNCE_MS = 150;
 const CONTEXT_FOLLOW_SUPPRESS_MS = 400;
 
+/** Rebase local seq against daemon latest_seq + clock (plugin reload safe). */
+function nextContextSyncSeq(localSeq, daemonSeq, nowMs) {
+  const local = Number(localSeq) || 0;
+  const daemon = Number(daemonSeq) || 0;
+  const ms = nowMs == null ? Date.now() : Number(nowMs) || 0;
+  const clockBase = ms * 1000;
+  return Math.max(local, daemon, clockBase) + 1;
+}
+
 class CursorSidecarPlugin extends Plugin {
   async onload() {
     const saved = await this.loadData();
@@ -550,7 +559,11 @@ class CursorSidecarPlugin extends Plugin {
         return null;
       }
 
-      this._cfSeq += 1;
+      const daemonSeq = Number(
+        (status.context_sync && status.context_sync.latest_seq) || 0
+      );
+      this._cfSeq = nextContextSyncSeq(this._cfSeq, daemonSeq, Date.now());
+
       const body = {
         cmd: "sync-editor-file",
         vault_root: vaultRoot,
@@ -561,8 +574,16 @@ class CursorSidecarPlugin extends Plugin {
       if (line !== null) body.line = line;
       if (column !== null) body.column = column;
 
-      const result = await this.httpJson("POST", "/rpc", body);
-      // Success: no Notice (silent follow)
+      let result = await this.httpJson("POST", "/rpc", body);
+
+      // Stale seq after plugin reload: rebase once and retry (never infinite)
+      if (result && result.discarded === true && result.reason === "stale_seq") {
+        const latest = Number(result.latest_seq || daemonSeq || 0);
+        this._cfSeq = nextContextSyncSeq(this._cfSeq, latest, Date.now());
+        body.seq = this._cfSeq;
+        result = await this.httpJson("POST", "/rpc", body);
+      }
+
       if (!result || result.ok === false) {
         const err = (result && result.error) || "sync failed";
         if (err === "sidecar_not_attached" || err === "stale_binding") {
@@ -570,6 +591,13 @@ class CursorSidecarPlugin extends Plugin {
         }
         return null;
       }
+
+      // ok=true + discarded must not count as a successful sync
+      if (result.discarded === true || result.queued === false) {
+        return null;
+      }
+
+      // queued=true (or legacy helpers without queued field after real open)
       this._cfLastPath = absPath;
       this._cfLastLine = line;
       this._cfLastSyncAt = Date.now();

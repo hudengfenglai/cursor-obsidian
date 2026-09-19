@@ -25,6 +25,25 @@ class SyncJob:
 ExecuteFn = Callable[[SyncJob], dict[str, Any]]
 
 
+def next_context_sync_seq(
+    local_seq: int | None,
+    daemon_seq: int | None,
+    now_ms: int | None = None,
+) -> int:
+    """
+    Rebase local sequence against daemon latest_seq and a clock base.
+
+    Ensures plugin reload (local_seq reset) still produces a seq > daemon_seq.
+    now_ms is milliseconds since epoch; multiplied by 1000 for headroom vs daemon counters.
+    """
+    local = int(local_seq or 0)
+    daemon = int(daemon_seq or 0)
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    clock_base = int(now_ms) * 1000
+    return max(local, daemon, clock_base) + 1
+
+
 class ContextSyncController:
     """Single-channel context sync: pending max 1, latest wins."""
 

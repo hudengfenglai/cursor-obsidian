@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cursor Sidecar v0.3 — Attach/Detach + Live Sidecar (WinEventHook follow)."""
+"""Cursor Sidecar v0.6 — Live Sidecar + Context Bridge + Context Follow."""
 
 from __future__ import annotations
 
@@ -1117,9 +1117,9 @@ def sync_editor_file_result(
             "cmd": "sync-editor-file",
         }
 
-    # seq: client-provided, else monotonic time-based fallback
+    # seq: client-provided, else monotonic epoch ms (no modulo wrap)
     if seq is None:
-        seq = int(time.time() * 1000) % 2_000_000_000
+        seq = int(time.time_ns() // 1_000_000)
     job = SyncJob(
         seq=int(seq),
         vault_root=str(vault_root),
@@ -1713,7 +1713,7 @@ def _peek_data_dir(argv: list[str]) -> str | None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.5 Zero-config Packaging")
+    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.6 Context Follow")
     p.add_argument("-c", "--config", default=str(DEFAULT_CONFIG))
     p.add_argument("--data-dir", default=None, help="Override writable DATA_DIR")
     p.add_argument("--version", action="store_true", help="Print helper version and exit")
