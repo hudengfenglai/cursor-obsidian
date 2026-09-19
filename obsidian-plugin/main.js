@@ -22,6 +22,8 @@ const DEFAULT_SETTINGS = {
   liveSidecar: true,
   contextFollow: false,
   openVaultInCursor: true,
+  /** Fixed Cursor project folder. Empty → current Obsidian vault; filled on first load. */
+  cursorProjectFolder: "",
   showNotices: true,
   embeddedPaneExperimental: true,
   borderlessCursorExperimental: false,
@@ -250,6 +252,14 @@ class CursorSidecarPlugin extends Plugin {
     // Migrate v0.2.1 useDaemon → liveSidecar
     if (saved && saved.liveSidecar === undefined && saved.useDaemon !== undefined) {
       this.settings.liveSidecar = !!saved.useDaemon;
+    }
+    // Default Cursor project = this Obsidian vault folder (persist once)
+    if (!(this.settings.cursorProjectFolder || "").trim()) {
+      const vault = this.vaultPath();
+      if (vault) {
+        this.settings.cursorProjectFolder = vault;
+        await this.saveSettings();
+      }
     }
     addIcon(ICON_ID, ICON_SVG);
 
@@ -956,6 +966,13 @@ class CursorSidecarPlugin extends Plugin {
     return adapter && adapter.basePath ? adapter.basePath : "";
   }
 
+  /** Folder Cursor should treat as the fixed project (Obsidian vault by default). */
+  cursorProjectPath() {
+    const fixed = (this.settings.cursorProjectFolder || "").trim();
+    if (fixed) return fixed;
+    return this.vaultPath();
+  }
+
   resolvePluginDir() {
     // Prefer Obsidian-provided absolute plugin dir when available
     if (this.manifest && typeof this.manifest.dir === "string" && this.manifest.dir) {
@@ -1145,7 +1162,7 @@ class CursorSidecarPlugin extends Plugin {
 
   async openVaultInCursor() {
     if (!this.helperConfigured()) return null;
-    const vaultRoot = this.vaultPath();
+    const vaultRoot = this.cursorProjectPath();
     this.notify("Cursor Sidecar: opening vault in Cursor…");
     try {
       const up = await this.ensureDaemon();
@@ -1554,7 +1571,7 @@ class CursorSidecarPlugin extends Plugin {
       this.settings.openVaultInCursor &&
       (cmd === "click" || cmd === "attach" || cmd === "dock")
     ) {
-      body.workspace = this.vaultPath();
+      body.workspace = this.cursorProjectPath();
     }
     return body;
   }
@@ -1611,7 +1628,7 @@ class CursorSidecarPlugin extends Plugin {
       this.settings.openVaultInCursor &&
       (command === "click" || command === "attach" || command === "dock")
     ) {
-      extra.push("--workspace", this.vaultPath());
+      extra.push("--workspace", this.cursorProjectPath());
     }
     const cmdArgs =
       command === "status" ? [...extra, "status", "--json"] : [...extra, command];
@@ -1812,7 +1829,34 @@ class CursorSidecarSettingTab extends PluginSettingTab {
     }
 
     new Setting(containerEl)
-      .setName("Open vault in Cursor on Attach")
+      .setName("Cursor 默认项目文件夹")
+      .setDesc(
+        "Cursor Sidecar 打开 / Attach 时固定使用此文件夹作为 Cursor 项目。默认是当前 Obsidian 库根目录。"
+      )
+      .addText((text) => {
+        text
+          .setPlaceholder("例如 D:\\胡梦浩obsidian")
+          .setValue(this.plugin.settings.cursorProjectFolder || "")
+          .onChange(async (value) => {
+            this.plugin.settings.cursorProjectFolder = value.trim();
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.style.width = "100%";
+      })
+      .addButton((btn) =>
+        btn.setButtonText("填入当前库").onClick(async () => {
+          const vault = this.plugin.vaultPath();
+          this.plugin.settings.cursorProjectFolder = vault;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Always open this vault in Cursor on Attach")
+      .setDesc(
+        "On Attach, open the Cursor 默认项目文件夹 in the bound Cursor Editor (--reuse-window)."
+      )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.openVaultInCursor).onChange(async (value) => {
           this.plugin.settings.openVaultInCursor = value;

@@ -681,9 +681,10 @@ def ensure_cursor(
         cfg["cursor_exe_verified"] = exe
     args: list[str] = []
     if file_path:
-        args.append(file_path)
+        args.extend(["--reuse-window", file_path])
     elif workspace:
-        args.append(workspace)
+        # Force vault into an existing Editor window when Cursor is already up
+        args.extend(["--reuse-window", workspace])
 
     if is_process_running(proc):
         if args and exe:
@@ -697,8 +698,10 @@ def ensure_cursor(
         raise RuntimeError(
             "Cursor.exe not found. Set path in settings (Advanced) or config.cursor_exe_verified"
         )
-    print(f"[sidecar] launching {exe}" + (f" {' '.join(args)}" if args else ""))
-    launch_process(exe, args=args or None)
+    # Cold start: open the vault folder directly (no --reuse-window needed)
+    cold_args = [file_path or workspace] if (file_path or workspace) else None
+    print(f"[sidecar] launching {exe}" + (f" {' '.join(cold_args)}" if cold_args else ""))
+    launch_process(exe, args=cold_args)
 
     def _find_editor():
         sel = select_editor_window(proc)
@@ -712,6 +715,36 @@ def ensure_cursor(
     found = wait_for_window(_find_editor, timeout_s=45.0)
     if not found:
         raise RuntimeError("Cursor launched but Editor window not classified in time")
+
+
+def _open_workspace_in_bound_editor(
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    workspace: str | None,
+) -> dict[str, Any] | None:
+    """After Attach: pin Obsidian vault into the bound Editor (--reuse-window)."""
+    if not workspace:
+        return None
+    binding = get_editor_binding(state) or state.get("cursor")
+    if not isinstance(binding, dict) or not binding.get("hwnd"):
+        return None
+    try:
+        result = _editor_bridge(cfg).open_folder(
+            binding=binding,
+            path=str(workspace),
+            focus=False,
+        )
+        if result.get("ok"):
+            print(f"[sidecar] bound Editor workspace -> {workspace}")
+        else:
+            print(
+                f"[sidecar] bound Editor workspace failed: "
+                f"{result.get('error') or result}"
+            )
+        return result
+    except Exception as exc:
+        print(f"[sidecar] bound Editor workspace error: {exc}")
+        return {"ok": False, "error": str(exc)}
 
 
 def _monitor_arg(cfg: dict[str, Any]) -> int | None:
@@ -785,6 +818,7 @@ def cmd_attach(
                 if _FOLLOW:
                     _FOLLOW.update_cursor_width(right.width)
                     _FOLLOW.follow_now()
+                _open_workspace_in_bound_editor(cfg, state, workspace)
                 print("[sidecar] attach (idempotent rearrange)")
                 return 0
 
@@ -856,6 +890,7 @@ def cmd_attach(
         }
         write_state(new_state)
         start_live_follow_if_daemon(cfg, new_state)
+        _open_workspace_in_bound_editor(cfg, new_state, workspace)
         print(
             f"[sidecar] attached\n"
             f"  Obsidian hwnd={obs.hwnd} pid={obs.pid}\n"
