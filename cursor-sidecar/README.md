@@ -99,21 +99,31 @@ cursor-sidecar/
 └── README.md
 ```
 
-## Phase 2 — Obsidian plugin (not in this MVP)
+## Phase 2 — Obsidian plugin
 
-Later plugin button `[◉ Cursor]` can shell out to:
+Plugin source: [`../obsidian-plugin`](../obsidian-plugin)
+
+Installed into vault as:
 
 ```text
-python main.py start
-python main.py toggle
-python main.py arrange
+<vault>/.obsidian/plugins/cursor-sidecar/
 ```
 
-Plugin responsibilities only:
+Ribbon icon runs:
 
-1. Resolve vault path / optionally pass workspace to Cursor later (Phase 3).
-2. Call this helper via `child_process` / URI / local HTTP.
-3. Do **not** try to host Cursor UI inside an Obsidian Electron webview.
+```text
+python main.py --workspace <vault> click
+```
+
+Extra CLI commands:
+
+```powershell
+python main.py dock                 # launch + arrange once (no follow)
+python main.py click                # dock if down, toggle if up
+python main.py start --no-follow
+python main.py --workspace "D:\vault" dock
+python main.py status --json
+```
 
 ## Phase 3 — Context (optional)
 

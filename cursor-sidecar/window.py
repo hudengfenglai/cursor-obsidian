@@ -271,9 +271,14 @@ def is_process_running(process_name: str) -> bool:
     return False
 
 
-def launch_process(exe_path: str, cwd: Optional[str] = None) -> None:
+def launch_process(
+    exe_path: str,
+    args: Optional[list[str]] = None,
+    cwd: Optional[str] = None,
+) -> None:
+    cmd = [exe_path, *(args or [])]
     subprocess.Popen(
-        [exe_path],
+        cmd,
         cwd=cwd or os.path.dirname(exe_path),
         shell=False,
         stdout=subprocess.DEVNULL,

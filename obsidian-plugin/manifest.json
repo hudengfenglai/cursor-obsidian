@@ -1,0 +1,10 @@
+{
+  "id": "cursor-sidecar",
+  "name": "Cursor Sidecar",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Dock real Cursor Desktop beside Obsidian via the Windows sidecar helper. Does not embed or modify Cursor.",
+  "author": "hudengfenglai",
+  "authorUrl": "https://github.com/hudengfenglai/cursor-obsidian",
+  "isDesktopOnly": true
+}

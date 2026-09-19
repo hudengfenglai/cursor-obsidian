@@ -80,9 +80,15 @@ def clear_pid() -> None:
         PID_FILE.unlink()
 
 
-def ensure_cursor(cfg: dict[str, Any]) -> None:
+def ensure_cursor(cfg: dict[str, Any], workspace: str | None = None) -> None:
     proc = cfg["cursor_process"]
     if is_process_running(proc):
+        # Already running — optionally open folder in existing instance.
+        if workspace:
+            exe = resolve_cursor_exe(cfg.get("cursor_exe_candidates", []))
+            if exe:
+                print(f"[sidecar] opening workspace in Cursor: {workspace}")
+                launch_process(exe, args=[workspace])
         return
     if not cfg["launch_cursor_if_missing"]:
         raise RuntimeError(f"{proc} is not running and launch_cursor_if_missing=false")
@@ -92,8 +98,9 @@ def ensure_cursor(cfg: dict[str, Any]) -> None:
         raise RuntimeError(
             "Cursor.exe not found. Add path to config.cursor_exe_candidates"
         )
-    print(f"[sidecar] launching {exe}")
-    launch_process(exe)
+    args = [workspace] if workspace else None
+    print(f"[sidecar] launching {exe}" + (f" {workspace}" if workspace else ""))
+    launch_process(exe, args=args)
 
     found = wait_for_window(
         lambda: find_cursor_window(proc, cfg.get("cursor_title_hint", "")),
@@ -179,8 +186,8 @@ def follow_loop(cfg: dict[str, Any]) -> None:
         time.sleep(poll)
 
 
-def cmd_start(cfg: dict[str, Any]) -> int:
-    ensure_cursor(cfg)
+def cmd_start(cfg: dict[str, Any], workspace: str | None = None, follow: bool | None = None) -> int:
+    ensure_cursor(cfg, workspace=workspace)
     # Wait for Obsidian too.
     obs = wait_for_window(
         lambda: find_obsidian_window(
@@ -196,17 +203,42 @@ def cmd_start(cfg: dict[str, Any]) -> int:
         return 1
 
     do_arrange(cfg)
-    if cfg.get("follow_obsidian", True):
+    do_follow = cfg.get("follow_obsidian", True) if follow is None else follow
+    if do_follow:
         follow_loop(cfg)
     return 0
 
 
-def cmd_arrange(cfg: dict[str, Any]) -> int:
+def cmd_dock(cfg: dict[str, Any], workspace: str | None = None) -> int:
+    """Launch Cursor if needed, arrange once — no follow loop (plugin-friendly)."""
+    return cmd_start(cfg, workspace=workspace, follow=False)
+
+
+def cmd_click(cfg: dict[str, Any], workspace: str | None = None) -> int:
+    """Ribbon semantics: dock if Cursor down; toggle visibility if up."""
+    proc = cfg["cursor_process"]
+    if is_process_running(proc):
+        # Prefer toggle when a window already exists (visible or hidden).
+        try:
+            return cmd_toggle(cfg)
+        except RuntimeError:
+            # Process up but window not ready — wait and dock.
+            wait_for_window(
+                lambda: find_cursor_window(proc, cfg.get("cursor_title_hint", "")),
+                timeout_s=20.0,
+            )
+            return cmd_dock(cfg, workspace=workspace)
+    return cmd_dock(cfg, workspace=workspace)
+
+
+def cmd_arrange(cfg: dict[str, Any], workspace: str | None = None) -> int:
+    del workspace  # unused
     do_arrange(cfg)
     return 0
 
 
-def cmd_stop(_: dict[str, Any]) -> int:
+def cmd_stop(cfg: dict[str, Any], workspace: str | None = None) -> int:
+    del cfg, workspace
     pid = read_pid()
     if not pid:
         print("[sidecar] no follow loop pid file")
@@ -222,7 +254,8 @@ def cmd_stop(_: dict[str, Any]) -> int:
     return 0
 
 
-def cmd_toggle(cfg: dict[str, Any]) -> int:
+def cmd_toggle(cfg: dict[str, Any], workspace: str | None = None) -> int:
+    del workspace
     state = toggle_cursor_visibility(
         cfg["cursor_process"], cfg.get("cursor_title_hint", "")
     )
@@ -230,13 +263,38 @@ def cmd_toggle(cfg: dict[str, Any]) -> int:
     return 0
 
 
-def cmd_status(cfg: dict[str, Any]) -> int:
+def cmd_status(cfg: dict[str, Any], workspace: str | None = None, as_json: bool = False) -> int:
+    del workspace
     obs = find_obsidian_window(
         cfg["obsidian_process"], cfg.get("obsidian_title_hint", "")
     )
     cur = find_cursor_window(
         cfg["cursor_process"], cfg.get("cursor_title_hint", "")
     )
+    payload = {
+        "obsidian": None
+        if not obs
+        else {
+            "hwnd": obs.hwnd,
+            "pid": obs.pid,
+            "title": obs.title,
+            "rect": list(obs.rect.as_tuple()),
+        },
+        "cursor": None
+        if not cur
+        else {
+            "hwnd": cur.hwnd,
+            "pid": cur.pid,
+            "title": cur.title,
+            "rect": list(cur.rect.as_tuple()),
+            "visible": bool(__import__("win32gui").IsWindowVisible(cur.hwnd)),
+        },
+        "cursor_running": is_process_running(cfg["cursor_process"]),
+        "follow_pid": read_pid(),
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
     print("[sidecar] status")
     if obs:
         print(f"  Obsidian: hwnd={obs.hwnd} pid={obs.pid} {obs.rect.as_tuple()} \"{obs.title}\"")
@@ -246,8 +304,8 @@ def cmd_status(cfg: dict[str, Any]) -> int:
         print(f"  Cursor:   hwnd={cur.hwnd} pid={cur.pid} {cur.rect.as_tuple()} \"{cur.title}\"")
     else:
         print("  Cursor:   not found")
-    pid = read_pid()
-    print(f"  follow pid: {pid or 'none'}")
+    print(f"  cursor running: {payload['cursor_running']}")
+    print(f"  follow pid: {payload['follow_pid'] or 'none'}")
     return 0
 
 
@@ -262,13 +320,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_CONFIG),
         help="path to config.json",
     )
+    p.add_argument(
+        "--workspace",
+        default=None,
+        help="folder to open in Cursor (usually the Obsidian vault path)",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("start", help="ensure Cursor, arrange, optionally follow Obsidian")
+    start_p = sub.add_parser("start", help="ensure Cursor, arrange, optionally follow Obsidian")
+    start_p.add_argument(
+        "--no-follow",
+        action="store_true",
+        help="arrange once without follow loop",
+    )
+    sub.add_parser("dock", help="launch Cursor if needed + arrange once (no follow)")
+    sub.add_parser(
+        "click",
+        help="Obsidian ribbon action: dock if Cursor down, else show/hide",
+    )
     sub.add_parser("arrange", help="one-shot 70/30 (configurable) split")
     sub.add_parser("stop", help="stop follow loop started by start")
     sub.add_parser("toggle", help="show/hide Cursor window")
-    sub.add_parser("status", help="print window discovery info")
+    status_p = sub.add_parser("status", help="print window discovery info")
+    status_p.add_argument("--json", action="store_true", help="machine-readable JSON")
     return p
 
 
@@ -276,15 +350,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cfg = load_config(Path(args.config))
+    workspace = args.workspace
 
-    handlers = {
-        "start": cmd_start,
-        "arrange": cmd_arrange,
-        "stop": cmd_stop,
-        "toggle": cmd_toggle,
-        "status": cmd_status,
-    }
-    return handlers[args.command](cfg)
+    if args.command == "start":
+        return cmd_start(cfg, workspace=workspace, follow=not args.no_follow)
+    if args.command == "dock":
+        return cmd_dock(cfg, workspace=workspace)
+    if args.command == "click":
+        return cmd_click(cfg, workspace=workspace)
+    if args.command == "arrange":
+        return cmd_arrange(cfg, workspace=workspace)
+    if args.command == "stop":
+        return cmd_stop(cfg, workspace=workspace)
+    if args.command == "toggle":
+        return cmd_toggle(cfg, workspace=workspace)
+    if args.command == "status":
+        return cmd_status(cfg, workspace=workspace, as_json=bool(args.json))
+    parser.error(f"unknown command: {args.command}")
+    return 2
 
 
 if __name__ == "__main__":
