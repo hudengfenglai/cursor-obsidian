@@ -1,4 +1,4 @@
-const { Plugin, Notice, PluginSettingTab, Setting, addIcon } = require("obsidian");
+const { Plugin, Notice, PluginSettingTab, Setting, addIcon, MarkdownView, TFile, FileSystemAdapter } = require("obsidian");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -86,6 +86,49 @@ class CursorSidecarPlugin extends Plugin {
       name: "Sidecar status",
       callback: async () => this.runAction("status", true),
     });
+    this.addCommand({
+      id: "cursor-sidecar-open-current-note",
+      name: "Cursor Sidecar: Open current note in Cursor",
+      callback: async () => this.openCurrentNoteInCursor(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-open-vault",
+      name: "Cursor Sidecar: Open current vault in Cursor",
+      callback: async () => this.openVaultInCursor(),
+    });
+
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!(file instanceof TFile)) return;
+        menu.addItem((item) => {
+          item
+            .setTitle("Open in Cursor")
+            .setIcon(ICON_ID)
+            .onClick(async () => {
+              await this.openFileInCursor(file, null, null);
+            });
+        });
+      })
+    );
+
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor, view) => {
+        menu.addItem((item) => {
+          item
+            .setTitle("Open in Cursor")
+            .setIcon(ICON_ID)
+            .onClick(async () => {
+              const file = view && view.file;
+              if (!file) {
+                this.notify("No active file", true);
+                return;
+              }
+              const cur = editor.getCursor();
+              await this.openFileInCursor(file, cur.line, cur.ch);
+            });
+        });
+      })
+    );
 
     this.addSettingTab(new CursorSidecarSettingTab(this.app, this));
   }
@@ -134,6 +177,140 @@ class CursorSidecarPlugin extends Plugin {
 
   vaultPath() {
     return this.app.vault.adapter.basePath;
+  }
+
+  getCurrentEditorContext() {
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof FileSystemAdapter) && typeof adapter.getBasePath !== "function") {
+      // Desktop FileSystemAdapter required for absolute paths
+      if (!adapter || typeof adapter.basePath !== "string") {
+        return { ok: false, error: "desktop_filesystem_required" };
+      }
+    }
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      return { ok: false, error: "no_active_file" };
+    }
+    const vaultRoot = this.vaultPath();
+    const absPath = path.join(vaultRoot, file.path);
+    let line = null;
+    let column = null;
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (view && view.editor) {
+      const cur = view.editor.getCursor();
+      // Obsidian is 0-based; Cursor Desktop expects 1-based
+      line = cur.line + 1;
+      column = cur.ch + 1;
+    }
+    return {
+      ok: true,
+      vaultRoot,
+      path: absPath,
+      relativePath: file.path,
+      line,
+      column,
+    };
+  }
+
+  async openCurrentNoteInCursor() {
+    const ctx = this.getCurrentEditorContext();
+    if (!ctx.ok) {
+      if (ctx.error === "desktop_filesystem_required") {
+        this.notify("Cursor Sidecar: Desktop filesystem vault required.", true);
+      } else {
+        this.notify("Cursor Sidecar: no active note to open.", true);
+      }
+      return null;
+    }
+    return await this.openAbsoluteInCursor(ctx.vaultRoot, ctx.path, ctx.line, ctx.column);
+  }
+
+  async openVaultInCursor() {
+    if (!this.pathsConfigured()) return null;
+    const vaultRoot = this.vaultPath();
+    this.notify("Cursor Sidecar: opening vault in Cursor…");
+    try {
+      const up = await this.ensureDaemon();
+      if (!up) {
+        this.notify("Cursor Sidecar: daemon unavailable", true);
+        return null;
+      }
+      const result = await this.httpJson("POST", "/rpc", {
+        cmd: "open-editor-vault",
+        path: vaultRoot,
+        focus: true,
+      });
+      if (!result || result.ok === false) {
+        const err = (result && result.error) || "rpc failed";
+        if (err === "sidecar_not_attached") {
+          this.notify("Attach Cursor Sidecar first.", true);
+        } else {
+          this.notify(`Open vault failed: ${String(err).slice(0, 200)}`, true);
+        }
+        return null;
+      }
+      this.notify(`Opened vault in Cursor (${result.method || "ok"})`);
+      return result;
+    } catch (err) {
+      this.notify(`Open vault error: ${err.message || err}`, true);
+      return null;
+    }
+  }
+
+  async openFileInCursor(tfile, line0, ch0) {
+    if (!tfile) {
+      this.notify("No file", true);
+      return null;
+    }
+    const vaultRoot = this.vaultPath();
+    const absPath = path.join(vaultRoot, tfile.path);
+    let line = null;
+    let column = null;
+    if (line0 !== null && line0 !== undefined) {
+      line = line0 + 1;
+      column = ch0 !== null && ch0 !== undefined ? ch0 + 1 : 1;
+    }
+    return await this.openAbsoluteInCursor(vaultRoot, absPath, line, column);
+  }
+
+  async openAbsoluteInCursor(vaultRoot, absPath, line, column) {
+    if (!this.pathsConfigured()) return null;
+    this.notify("Cursor Sidecar: opening note in Cursor…");
+    try {
+      const up = await this.ensureDaemon();
+      if (!up) {
+        this.notify("Cursor Sidecar: daemon unavailable", true);
+        return null;
+      }
+      const body = {
+        cmd: "open-editor-file",
+        vault_root: vaultRoot,
+        path: absPath,
+        focus: true,
+      };
+      if (line !== null && line !== undefined) body.line = line;
+      if (column !== null && column !== undefined) body.column = column;
+      const result = await this.httpJson("POST", "/rpc", body);
+      if (!result || result.ok === false) {
+        const err = (result && result.error) || "rpc failed";
+        if (err === "sidecar_not_attached") {
+          this.notify("Attach Cursor Sidecar first.", true);
+        } else {
+          this.notify(`Open in Cursor failed: ${String(err).slice(0, 200)}`, true);
+        }
+        return null;
+      }
+      const where =
+        result.line != null
+          ? `${result.path}:${result.line}${result.column != null ? ":" + result.column : ""}`
+          : result.path;
+      const warn = result.routing_warning ? ` (${result.routing_warning})` : "";
+      this.notify(`Opened in Cursor via ${result.method}: ${String(where).slice(0, 180)}${warn}`);
+      return result;
+    } catch (err) {
+      this.notify(`Open in Cursor error: ${err.message || err}`, true);
+      return null;
+    }
   }
 
   resolveDaemonToken() {

@@ -1,9 +1,9 @@
 {
   "id": "cursor-sidecar",
   "name": "Cursor Sidecar",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.5.0",
-  "description": "Live Sidecar: Cursor Desktop follows Obsidian while attached (v0.3).",
+  "description": "Live Sidecar + Context Bridge: open current Obsidian note in bound Cursor Desktop Editor (v0.4).",
   "author": "hudengfenglai",
   "authorUrl": "https://github.com/hudengfenglai/cursor-obsidian",
   "isDesktopOnly": true

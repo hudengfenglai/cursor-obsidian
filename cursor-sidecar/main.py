@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from editor_bridge import EditorBridge
 from geometry import (
     atomic_write_text,
     can_restore_bound_window,
@@ -54,7 +55,7 @@ DAEMON_PID_FILE = ROOT / ".sidecar.daemon.pid"
 TOKEN_FILE = ROOT / ".sidecar.daemon.token"
 STATE_FILE = ROOT / ".sidecar.state.json"
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 LIFECYCLE_LOCK = threading.RLock()
 _FOLLOW: LiveFollowService | None = None
@@ -711,6 +712,123 @@ def cmd_open(
     return 0
 
 
+def _editor_bridge(cfg: dict[str, Any]) -> EditorBridge:
+    return EditorBridge(
+        validate_binding=validate_window_binding,
+        focus_hwnd=focus_window,
+        process_name=str(cfg.get("cursor_process") or "Cursor.exe"),
+    )
+
+
+def open_editor_file_result(
+    cfg: dict[str, Any],
+    *,
+    vault_root: str | None,
+    path: str | None,
+    line: int | None = None,
+    column: int | None = None,
+    focus: bool = True,
+) -> dict[str, Any]:
+    """Context Bridge: open vault file in bound Cursor Desktop Editor. No state mutation."""
+    truth = refresh_attachment_truth()
+    if not truth["attached"]:
+        return {
+            "ok": False,
+            "error": "sidecar_not_attached",
+            "message": "Attach Cursor Sidecar first.",
+        }
+    if not path:
+        return {"ok": False, "error": "path_required"}
+    if not vault_root:
+        return {"ok": False, "error": "vault_root_required"}
+
+    state_before = read_state()
+    binding = dict(state_before.get("cursor") or {})
+    result = _editor_bridge(cfg).open_file(
+        binding=binding,
+        vault_root=vault_root,
+        path=path,
+        line=line,
+        column=column,
+        focus=bool(focus),
+    )
+    # Guarantee Sidecar lifecycle fields untouched
+    state_after = read_state()
+    for key in ("attached", "preset", "obsidian", "cursor", "left_rect", "right_rect"):
+        if state_before.get(key) != state_after.get(key):
+            result["state_mutation_warning"] = key
+            break
+    result["cmd"] = "open-editor-file"
+    return result
+
+
+def open_editor_vault_result(
+    cfg: dict[str, Any],
+    *,
+    path: str | None,
+    focus: bool = True,
+) -> dict[str, Any]:
+    """Context Bridge: open vault folder in bound Cursor Desktop Editor. No state mutation."""
+    truth = refresh_attachment_truth()
+    if not truth["attached"]:
+        return {
+            "ok": False,
+            "error": "sidecar_not_attached",
+            "message": "Attach Cursor Sidecar first.",
+        }
+    if not path:
+        return {"ok": False, "error": "path_required"}
+
+    state_before = read_state()
+    binding = dict(state_before.get("cursor") or {})
+    result = _editor_bridge(cfg).open_folder(
+        binding=binding,
+        path=path,
+        focus=bool(focus),
+    )
+    state_after = read_state()
+    for key in ("attached", "preset", "obsidian", "cursor", "left_rect", "right_rect"):
+        if state_before.get(key) != state_after.get(key):
+            result["state_mutation_warning"] = key
+            break
+    result["cmd"] = "open-editor-vault"
+    return result
+
+
+def cmd_open_editor_file(
+    cfg: dict[str, Any],
+    *,
+    vault_root: str | None = None,
+    path: str | None = None,
+    line: int | None = None,
+    column: int | None = None,
+    focus: bool = True,
+    **_: Any,
+) -> int:
+    result = open_editor_file_result(
+        cfg,
+        vault_root=vault_root,
+        path=path,
+        line=line,
+        column=column,
+        focus=focus,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_open_editor_vault(
+    cfg: dict[str, Any],
+    *,
+    path: str | None = None,
+    focus: bool = True,
+    **_: Any,
+) -> int:
+    result = open_editor_vault_result(cfg, path=path, focus=focus)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
 def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
     truth = refresh_attachment_truth()
     state = truth["state"]
@@ -914,6 +1032,23 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
             code = cmd_focus(cfg)
         elif cmd == "open":
             code = cmd_open(cfg, workspace=workspace, file_path=file_path)
+        elif cmd in ("open-editor-file", "open_editor_file"):
+            line = body.get("line")
+            column = body.get("column")
+            return open_editor_file_result(
+                cfg,
+                vault_root=body.get("vault_root") or workspace,
+                path=body.get("path") or file_path,
+                line=int(line) if line is not None else None,
+                column=int(column) if column is not None else None,
+                focus=bool(body.get("focus", True)),
+            )
+        elif cmd in ("open-editor-vault", "open_editor_vault"):
+            return open_editor_vault_result(
+                cfg,
+                path=body.get("path") or workspace or file_path,
+                focus=bool(body.get("focus", True)),
+            )
         elif cmd == "status":
             return {"ok": True, "cmd": cmd, "status": build_status(cfg)}
         else:
@@ -1071,7 +1206,7 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.3 Live Sidecar")
+    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.4 Context Bridge")
     p.add_argument("-c", "--config", default=str(DEFAULT_CONFIG))
     p.add_argument("--workspace", default=None)
     p.add_argument("--file", default=None)
@@ -1093,6 +1228,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("show", help="Show Cursor")
     sub.add_parser("hide", help="Hide Cursor")
     sub.add_parser("open", help="Open --file/--workspace in Cursor Desktop")
+    oef = sub.add_parser("open-editor-file", help="Context Bridge: open vault file in bound Cursor Editor")
+    oef.add_argument("--path", required=True)
+    oef.add_argument("--vault-root", required=True)
+    oef.add_argument("--line", type=int, default=None)
+    oef.add_argument("--column", type=int, default=None)
+    oef.add_argument("--no-focus", action="store_true")
+    oev = sub.add_parser("open-editor-vault", help="Context Bridge: open vault folder in bound Cursor Editor")
+    oev.add_argument("--path", required=True)
+    oev.add_argument("--no-focus", action="store_true")
     status_p = sub.add_parser("status", help="Attachment + window status")
     status_p.add_argument("--json", action="store_true")
     sub.add_parser("stop", help="Stop follow/daemon pids")
@@ -1136,6 +1280,21 @@ def main(argv: list[str] | None = None) -> int:
         flag = str(getattr(args, "enabled", "true")).lower()
         enabled = flag in ("true", "1", "on", "yes")
         return cmd_set_live_follow(cfg, enabled=enabled, **common)
+    if command == "open-editor-file":
+        return cmd_open_editor_file(
+            cfg,
+            vault_root=getattr(args, "vault_root", None),
+            path=getattr(args, "path", None),
+            line=getattr(args, "line", None),
+            column=getattr(args, "column", None),
+            focus=not bool(getattr(args, "no_focus", False)),
+        )
+    if command == "open-editor-vault":
+        return cmd_open_editor_vault(
+            cfg,
+            path=getattr(args, "path", None),
+            focus=not bool(getattr(args, "no_focus", False)),
+        )
 
     dispatch = {
         "attach": cmd_attach,

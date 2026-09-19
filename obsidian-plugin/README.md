@@ -1,21 +1,24 @@
-# Obsidian plugin — Cursor Sidecar v0.3
+# Obsidian plugin — Cursor Sidecar v0.4
 
-Ribbon: **Attach / Detach** (unchanged).
+Ribbon: **Attach / Detach**.
 
 ## Setup
 
-1. Copy this folder to `<vault>/.obsidian/plugins/cursor-sidecar/`
-2. Enable the plugin
-3. Settings → set **Sidecar directory** (folder with `main.py`)
-4. Enable **Live Sidecar** so Cursor follows Obsidian while attached
+1. Copy to `<vault>/.obsidian/plugins/cursor-sidecar/`
+2. Enable plugin → set **Sidecar directory**
+3. Enable **Live Sidecar**
+4. **Attach** before using Context Bridge
 
 ## Commands
 
-- Attach / Detach Cursor Sidecar
 - Attach / Detach / Arrange / Focus / Status
-- **Cursor Sidecar: Compact / Normal / Wide**
+- Compact / Normal / Wide
+- **Open current note in Cursor**
+- **Open current vault in Cursor**
 
-## Settings
+## Context menus
 
-- **Live Sidecar** — when enabled, Cursor follows Obsidian while attached (starts authenticated daemon as needed)
-- Advanced: daemon host / port
+- File explorer file → **Open in Cursor**
+- Markdown editor → **Open in Cursor** (with line/column)
+
+Requires Sidecar **attached**. Uses Desktop Editor launcher only (no Agent CLI).
