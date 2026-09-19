@@ -208,3 +208,32 @@ def test_ensure_propagates_trigger_failed_no_new_window(monkeypatch):
     )
     assert r["ok"] is False
     assert r["error"] == "trigger_failed_no_new_window"
+
+def test_cli_glass_trigger_launches(monkeypatch):
+    from agents_auto import trigger_agents_window_via_cli_glass
+
+    calls = []
+
+    monkeypatch.setattr(
+        "agents_auto.resolve_cursor_executable",
+        lambda cfg=None, binding=None, persist=False: {
+            "ok": True,
+            "path": r"E:\cursor\Cursor.exe",
+            "source": "test",
+        },
+    )
+
+    def fake_popen(args, **kwargs):
+        calls.append(args)
+
+        class P:
+            pid = 1
+
+        return P()
+
+    monkeypatch.setattr("agents_auto.subprocess.Popen", fake_popen)
+    r = trigger_agents_window_via_cli_glass(cfg={})
+    assert r["ok"] is True
+    assert r["launched"] is True
+    assert r["trigger_method"] == "cli_glass"
+    assert calls and calls[0][-2:] == ["--glass", "-n"]

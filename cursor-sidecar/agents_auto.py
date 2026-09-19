@@ -3,7 +3,7 @@
 Order:
   1) refresh + existing valid binding
   2) enumerate+classify → unique AGENT (restore if hidden)
-  3) trigger: win32_menu → alt_file_menu → uia_menu → command_palette
+  3) trigger: win32_menu → cli_glass → alt_file_menu → uia_menu → command_palette
      (ok only after new Agent HWND confirmed)
   4) wait by classification (not strict HWND diff of 1)
 Never visual fallback. Never bind AGENT as editor.
@@ -12,15 +12,18 @@ Never visual fallback. Never bind AGENT as editor.
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from ctypes import Structure, Union, byref, c_ulong, c_void_p, sizeof, windll
 from ctypes.wintypes import DWORD, WORD
+from pathlib import Path
 from typing import Any, Callable
 
 import win32con
 import win32gui
 
 from agents_menu import trigger_new_agents_via_win32_menu
+from cursor_exe import resolve_cursor_executable
 from cursor_windows import (
     ROLE_AGENT,
     agent_binding_ok,
@@ -28,6 +31,7 @@ from cursor_windows import (
     agent_hwnd,
     bind_agent_from_hwnd,
     editor_hwnd,
+    get_editor_binding,
     list_cursor_top_level,
     list_cursor_windows_classified,
     refresh_cursor_bindings,
@@ -247,6 +251,46 @@ def trigger_agents_window_via_alt_file_menu(editor_hwnd_i: int) -> dict[str, Any
         return {"ok": False, "error": str(exc), "trigger_method": "alt_file_menu"}
 
 
+def trigger_agents_window_via_cli_glass(
+    *,
+    cfg: dict[str, Any] | None = None,
+    binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Launch a new Agents/Glass window via public Cursor CLI flags.
+
+    ``Cursor.exe --glass -n`` opens a new Agents-oriented window (title often
+    "Cursor Agents") without depending on SendInput focus.
+    """
+    resolved = resolve_cursor_executable(cfg, binding=binding, persist=False)
+    if not resolved.get("ok"):
+        return {
+            "ok": False,
+            "error": resolved.get("error") or "cursor_exe_not_found",
+            "trigger_method": "cli_glass",
+            "tried": resolved.get("tried"),
+        }
+    exe = str(resolved["path"])
+    args = [exe, "--glass", "-n"]
+    try:
+        subprocess.Popen(
+            args,
+            cwd=str(Path(exe).parent),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+        )
+        return {
+            "ok": True,
+            "launched": True,
+            "trigger_method": "cli_glass",
+            "exe": exe,
+            "args": ["--glass", "-n"],
+            "source": resolved.get("source"),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "trigger_method": "cli_glass", "exe": exe}
+
+
 def _confirm_agent_appeared(
     *,
     before: list[dict[str, Any]],
@@ -271,10 +315,12 @@ def trigger_new_agents_window(
     process_name: str = "Cursor.exe",
     classify_list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
     list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
+    cfg: dict[str, Any] | None = None,
+    binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Try triggers in order; only return ok=True when a new Agent HWND is confirmed.
-    Priority: win32_menu → alt_file_menu → uia_menu → command_palette
+    Priority: win32_menu → cli_glass → alt_file_menu → uia_menu → command_palette
     """
     list_fn = list_fn or list_cursor_top_level
     classify_list_fn = classify_list_fn or list_cursor_windows_classified
@@ -284,11 +330,11 @@ def trigger_new_agents_window(
 
     def _try(label: str, result: dict[str, Any], confirm_s: float = 3.2) -> dict[str, Any] | None:
         attempts.append({"step": label, **{k: result.get(k) for k in (
-            "ok", "error", "trigger_method", "query", "keys_sent"
+            "ok", "error", "trigger_method", "query", "keys_sent", "launched"
         )}})
         if result.get("error") == "menu_item_disabled":
             return {**result, "should_rescan": True, "attempts": attempts}
-        if not result.get("ok") and not result.get("keys_sent"):
+        if not result.get("ok") and not result.get("keys_sent") and not result.get("launched"):
             return None
         confirmed = _confirm_agent_appeared(
             before=before,
@@ -314,12 +360,21 @@ def trigger_new_agents_window(
     if hit:
         return hit
 
-    # B: Alt → File → New Agents Window (Electron)
+    # B: Public CLI — Cursor.exe --glass -n (no SendInput / focus required)
+    hit = _try(
+        "cli_glass",
+        trigger_agents_window_via_cli_glass(cfg=cfg, binding=binding),
+        confirm_s=8.0,
+    )
+    if hit:
+        return hit
+
+    # C: Alt → File → New Agents Window (Electron)
     hit = _try("alt_file_menu", trigger_agents_window_via_alt_file_menu(eh))
     if hit:
         return hit
 
-    # C: UIA
+    # D: UIA
     try:
         from agents_uia import invoke_file_new_agents_window
 
@@ -330,7 +385,7 @@ def trigger_new_agents_window(
     if hit:
         return hit
 
-    # D: Command palette — exact New Agents Window only (avoid layout-switch commands)
+    # E: Command palette — exact New Agents Window only (avoid layout-switch commands)
     for query in _PALETTE_QUERIES:
         pal = trigger_agents_window_via_palette(eh, query=query)
         hit = _try(f"command_palette:{query}", pal, confirm_s=4.0)
@@ -342,7 +397,7 @@ def trigger_new_agents_window(
         "error": "trigger_failed_no_new_window",
         "trigger_method": None,
         "attempts": attempts,
-        "hint": "Palette/menu keys sent but no new Cursor HWND appeared",
+        "hint": "Menu/palette/CLI did not produce a new Agents HWND",
         "before_count": len(before),
     }
 
@@ -368,6 +423,19 @@ def find_existing_agent(
     if len(agents) == 1:
         return {"ok": True, "candidate": agents[0], "classified": classified, **counts}
     if len(agents) > 1:
+        preferred = [
+            a
+            for a in agents
+            if "agent" in str(a.get("title") or "").lower()
+        ]
+        if len(preferred) == 1:
+            return {
+                "ok": True,
+                "candidate": preferred[0],
+                "classified": classified,
+                "match": "preferred_agents_title",
+                **counts,
+            }
         return {
             "ok": False,
             "error": "agent_window_ambiguous",
@@ -525,6 +593,8 @@ def ensure_agents_window_bound(
                 process_name=proc,
                 classify_list_fn=classify_list_fn,
                 list_fn=list_fn,
+                cfg=cfg,
+                binding=get_editor_binding(state),
             )
         except TypeError:
             trig = trigger_fn(eh)
