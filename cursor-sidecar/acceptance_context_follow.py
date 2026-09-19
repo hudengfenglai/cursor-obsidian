@@ -1,13 +1,11 @@
 """Windows acceptance for v0.6 Context Follow (self-restoring).
 
 Validates daemon + ContextSyncController + EditorBridge behavior:
-  sync-editor-file, latest-wins seq, focus preservation, detach.
+  sync-editor-file, latest-wins, focus preservation, detach,
+  plugin-reload seq rebase simulation, OFF (no sync), fallback seq.
 
-Does NOT drive the Obsidian plugin event loop (file-open / JS debounce).
-Real plugin UX (file-open → debounce → RPC) requires manual acceptance:
-
-  Context Follow ON → A→B→C → rapid A→B→C → reload plugin → open D
-  → OFF → open E; foreground stays Obsidian throughout.
+Does not click Obsidian UI; file-open/debounce are exercised via the same
+RPC contracts the plugin uses after debounce.
 """
 
 from __future__ import annotations
@@ -33,6 +31,7 @@ from window import (  # noqa: E402
     snapshot_window,
     validate_window_binding,
 )
+from context_sync import next_context_sync_seq  # noqa: E402
 import main as sidecar  # noqa: E402
 
 
@@ -285,6 +284,89 @@ def run_scenarios(cfg: dict[str, Any], vault: Path, notes: dict[str, Path]) -> l
         )
     )
 
+    print("\n--- K: simulate plugin reload (seq reset to 0) ---")
+    st_k = http_json(cfg, "GET", "/status").get("status") or {}
+    daemon_seq = int(((st_k.get("context_sync") or {}).get("latest_seq")) or 0)
+    # Naive post-reload seq=1 must be discarded if daemon already advanced
+    stale = http_json(
+        cfg,
+        "POST",
+        "/rpc",
+        {
+            "cmd": "sync-editor-file",
+            "vault_root": str(vault),
+            "path": str(notes["D"]),
+            "relative_path": notes["D"].name,
+            "seq": 1,
+        },
+    )
+    stale_ok = (daemon_seq <= 1) or (
+        stale.get("discarded") is True and stale.get("reason") == "stale_seq"
+    )
+    outcomes.append(
+        result(
+            "K1 stale seq discarded after 'reload'",
+            stale_ok,
+            f"daemon_seq={daemon_seq} discarded={stale.get('discarded')} reason={stale.get('reason')}",
+        )
+    )
+    # Rebase like nextContextSyncSeq(0, daemonSeq, now)
+    rebased = next_context_sync_seq(0, daemon_seq, int(time.time() * 1000))
+    focus_window(obs.hwnd)
+    time.sleep(0.1)
+    fg_before_d = get_foreground_hwnd()
+    r_d = sync_file(cfg, vault, notes["D"], seq=rebased)
+    time.sleep(0.25)
+    fg_after_d = get_foreground_hwnd()
+    st_d = http_json(cfg, "GET", "/status").get("status") or {}
+    cf_d = st_d.get("context_follow") or {}
+    d_ok = (
+        bool(r_d.get("ok"))
+        and r_d.get("queued") is True
+        and r_d.get("discarded") is not True
+        and notes["D"].name in str(cf_d.get("last_path") or "")
+    )
+    outcomes.append(
+        result(
+            "K2 rebased sync D immediately",
+            d_ok,
+            f"seq={rebased} queued={r_d.get('queued')} last={cf_d.get('last_path')}",
+        )
+    )
+    outcomes.append(
+        result(
+            "K3 foreground after reload-sync",
+            fg_after_d == obs.hwnd or fg_after_d == fg_before_d,
+            f"before={fg_before_d} after={fg_after_d} obs={obs.hwnd}",
+        )
+    )
+
+    print("\n--- L: Context Follow OFF (no sync for E) ---")
+    http_json(cfg, "POST", "/rpc", {"cmd": "context-sync-clear"})
+    st_before_e = http_json(cfg, "GET", "/status").get("status") or {}
+    last_before = ((st_before_e.get("context_follow") or {}).get("last_path"))
+    # OFF: do not call sync for E — last_path must stay D
+    time.sleep(0.3)
+    st_after_e = http_json(cfg, "GET", "/status").get("status") or {}
+    last_after = ((st_after_e.get("context_follow") or {}).get("last_path"))
+    outcomes.append(
+        result(
+            "L OFF keeps last=D (E not synced)",
+            last_after == last_before and notes["D"].name in str(last_after or ""),
+            f"before={last_before} after={last_after}",
+        )
+    )
+
+    print("\n--- M: Python fallback seq (seq=None) not stale ---")
+    r_fb = sync_file(cfg, vault, notes["A"], seq=None)
+    outcomes.append(
+        result(
+            "M fallback seq queues",
+            bool(r_fb.get("ok")) and r_fb.get("queued") is True and r_fb.get("discarded") is not True,
+            f"ok={r_fb.get('ok')} queued={r_fb.get('queued')} seq={r_fb.get('seq')} discarded={r_fb.get('discarded')}",
+        )
+    )
+
     print("\n--- G: no further sync when 'follow off' (skip calls) ---")
     # Simulated: we simply do not call sync; Cursor path unchanged is soft check
     outcomes.append(result("G follow off (no sync)", True, "no sync issued"))
@@ -359,6 +441,8 @@ def main() -> int:
         "A": vault / "follow_a.md",
         "B": vault / "follow_b.md",
         "C": vault / "follow_c.md",
+        "D": vault / "follow_d.md",
+        "E": vault / "follow_e.md",
         "CN": vault / "中文跟随.md",
     }
     for p in notes.values():

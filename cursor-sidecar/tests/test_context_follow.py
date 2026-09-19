@@ -149,7 +149,45 @@ def test_python_fallback_seq_no_modulo():
 
     src = inspect.getsource(sidecar.sync_editor_file_result)
     assert "% 2_000_000_000" not in src
-    assert "time_ns" in src or "time.time_ns" in src
+    assert "next_context_sync_seq" in src
+
+
+def test_python_fallback_seq_not_stale_vs_plugin_scale(monkeypatch):
+    """RPC without seq must still queue after plugin-scale latest_seq."""
+    monkeypatch.setattr(
+        sidecar,
+        "refresh_attachment_truth",
+        lambda: {
+            "attached": True,
+            "state_valid": True,
+            "reason": "ok",
+            "state": {"cursor": {"hwnd": 1, "pid": 2}},
+        },
+    )
+    monkeypatch.setattr(sidecar, "validate_window_binding", lambda b: {"ok": True})
+    monkeypatch.setattr(sidecar, "is_path_inside_vault", lambda v, p: True)
+    monkeypatch.setattr(sidecar, "_execute_context_sync_job", lambda job: {"ok": True, "seq": job.seq})
+
+    ctrl = ContextSyncController(execute=lambda job: {"ok": True, "seq": job.seq})
+    # Simulate prior plugin sync at Date.now()*1000 scale
+    plugin_scale = 1_700_000_000_000_001
+    ctrl.submit(SyncJob(seq=plugin_scale, vault_root="v", path="prior.md"))
+    deadline = time.time() + 1.0
+    while time.time() < deadline and ctrl.status()["running"]:
+        time.sleep(0.01)
+    sidecar._CONTEXT_SYNC = ctrl
+
+    r = sidecar.sync_editor_file_result(
+        {},
+        vault_root=r"D:\vault",
+        path=r"D:\vault\a.md",
+        relative_path="a.md",
+        seq=None,
+    )
+    assert r.get("ok") is True
+    assert r.get("queued") is True
+    assert r.get("discarded") is not True
+    assert int(r.get("seq") or 0) > plugin_scale
 
 
 def test_pending_b_replaced_by_c():

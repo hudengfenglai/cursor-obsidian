@@ -30,7 +30,7 @@ from geometry import (
     resolve_preset,
 )
 from context_follow import ContextFollowGate, is_excluded_rel_path, is_path_inside_vault
-from context_sync import ContextSyncController, SyncJob
+from context_sync import ContextSyncController, SyncJob, next_context_sync_seq
 from runtime_paths import (
     DEFAULT_CONFIG_VALUES,
     VERSION,
@@ -1117,9 +1117,12 @@ def sync_editor_file_result(
             "cmd": "sync-editor-file",
         }
 
-    # seq: client-provided, else monotonic epoch ms (no modulo wrap)
+    # seq: client-provided, else rebase against controller so fallback never goes stale
+    # vs plugin clock-scale seqs (Date.now()*1000 ≈ epoch µs).
     if seq is None:
-        seq = int(time.time_ns() // 1_000_000)
+        ctrl = _get_context_sync()
+        latest = int((ctrl.status() or {}).get("latest_seq") or 0)
+        seq = next_context_sync_seq(0, latest, int(time.time_ns() // 1_000_000))
     job = SyncJob(
         seq=int(seq),
         vault_root=str(vault_root),
