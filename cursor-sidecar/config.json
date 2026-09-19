@@ -1,0 +1,17 @@
+{
+  "obsidian_ratio": 0.7,
+  "cursor_ratio": 0.3,
+  "gap": 0,
+  "monitor": null,
+  "obsidian_process": "Obsidian.exe",
+  "cursor_process": "Cursor.exe",
+  "obsidian_title_hint": "Obsidian",
+  "cursor_title_hint": "Cursor",
+  "poll_ms": 500,
+  "follow_obsidian": true,
+  "launch_cursor_if_missing": true,
+  "cursor_exe_candidates": [
+    "%LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe",
+    "%LOCALAPPDATA%\\cursor\\Cursor.exe"
+  ]
+}
