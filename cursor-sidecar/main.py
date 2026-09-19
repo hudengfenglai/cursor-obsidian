@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import psutil
+
 from editor_bridge import EditorBridge
 from geometry import (
     atomic_write_text,
@@ -52,15 +54,17 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
 PID_FILE = ROOT / ".sidecar.pid"
 DAEMON_PID_FILE = ROOT / ".sidecar.daemon.pid"
+DAEMON_META_FILE = ROOT / ".sidecar.daemon.json"
 TOKEN_FILE = ROOT / ".sidecar.daemon.token"
 STATE_FILE = ROOT / ".sidecar.state.json"
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 LIFECYCLE_LOCK = threading.RLock()
 _FOLLOW: LiveFollowService | None = None
 _DAEMON_MODE = False
 _STOP_DAEMON = threading.Event()
+_DAEMON_HTTP_SERVER: ThreadingHTTPServer | None = None
 
 LOCALHOST_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -178,6 +182,172 @@ def write_pid(pid: int, path: Path = PID_FILE) -> None:
 def clear_pid(path: Path = PID_FILE) -> None:
     if path.exists():
         path.unlink()
+
+
+def read_daemon_meta() -> dict[str, Any]:
+    if not DAEMON_META_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(DAEMON_META_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_daemon_meta(
+    *,
+    pid: int,
+    host: str,
+    port: int,
+    process_create_time: float | None = None,
+) -> None:
+    if process_create_time is None:
+        try:
+            process_create_time = float(psutil.Process(int(pid)).create_time())
+        except (psutil.Error, ValueError, TypeError):
+            process_create_time = 0.0
+    payload = {
+        "pid": int(pid),
+        "process_create_time": float(process_create_time),
+        "host": normalize_daemon_bind_host(host),
+        "port": int(port),
+        "started_at": time.time(),
+        "main_py": str(ROOT / "main.py"),
+    }
+    atomic_write_text(
+        DAEMON_META_FILE,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    )
+
+
+def clear_daemon_meta() -> None:
+    if DAEMON_META_FILE.exists():
+        try:
+            DAEMON_META_FILE.unlink()
+        except OSError:
+            pass
+
+
+def verify_sidecar_daemon_process(meta: dict[str, Any]) -> dict[str, Any]:
+    """Confirm metadata still points at our helper process (anti PID-reuse)."""
+    if not meta:
+        return {"ok": False, "reason": "no_meta"}
+    try:
+        pid = int(meta.get("pid") or 0)
+        expected_ctime = float(meta.get("process_create_time") or 0.0)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "malformed_meta"}
+    if pid <= 0:
+        return {"ok": False, "reason": "malformed_meta"}
+    try:
+        proc = psutil.Process(pid)
+        live_ctime = float(proc.create_time())
+        if expected_ctime and abs(live_ctime - expected_ctime) > 1.5:
+            return {"ok": False, "reason": "create_time_mismatch", "pid": pid}
+        try:
+            cmdline = " ".join(proc.cmdline()).lower()
+        except (psutil.Error, OSError):
+            cmdline = ""
+        # Must look like: python ... main.py ... daemon
+        if "main.py" not in cmdline or "daemon" not in cmdline:
+            return {"ok": False, "reason": "not_sidecar_daemon", "pid": pid}
+        return {
+            "ok": True,
+            "pid": pid,
+            "host": str(meta.get("host") or ""),
+            "port": int(meta.get("port") or 0),
+            "process_create_time": live_ctime,
+        }
+    except psutil.Error:
+        return {"ok": False, "reason": "gone", "pid": pid}
+
+
+def request_daemon_shutdown() -> None:
+    """Signal the in-process daemon loop to stop (authenticated RPC path)."""
+    global _DAEMON_HTTP_SERVER
+    _STOP_DAEMON.set()
+    stop_live_follow()
+    srv = _DAEMON_HTTP_SERVER
+    if srv is not None:
+        threading.Thread(target=srv.shutdown, name="sidecar-http-shutdown", daemon=True).start()
+
+
+def stop_daemon_via_rpc(host: str, port: int, token: str, timeout: float = 3.0) -> bool:
+    """Authenticated shutdown against a running daemon endpoint. Returns True if accepted."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{host}:{int(port)}/rpc"
+    body = json.dumps({"cmd": "shutdown-daemon"}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "X-Cursor-Sidecar-Token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+            return bool(payload.get("ok"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return False
+
+
+def stop_existing_daemon_safe(meta: dict[str, Any]) -> str:
+    """
+    Stop old helper only when identity verifies.
+    Prefer authenticated RPC; fall back to terminate if still our process.
+    """
+    check = verify_sidecar_daemon_process(meta)
+    if not check.get("ok"):
+        clear_pid(DAEMON_PID_FILE)
+        clear_daemon_meta()
+        return f"stale ({check.get('reason')})"
+
+    host = str(check.get("host") or meta.get("host") or "127.0.0.1")
+    port = int(check.get("port") or meta.get("port") or 0)
+    pid = int(check["pid"])
+    token = ""
+    if TOKEN_FILE.is_file():
+        try:
+            token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+
+    if token and port > 0:
+        stop_daemon_via_rpc(host, port, token)
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if not verify_sidecar_daemon_process(meta).get("ok"):
+                clear_pid(DAEMON_PID_FILE)
+                clear_daemon_meta()
+                return "stopped_via_rpc"
+            time.sleep(0.1)
+
+    # Re-verify before kill — never terminate unrelated Python
+    check2 = verify_sidecar_daemon_process(meta)
+    if not check2.get("ok"):
+        clear_pid(DAEMON_PID_FILE)
+        clear_daemon_meta()
+        return "exited"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        clear_pid(DAEMON_PID_FILE)
+        clear_daemon_meta()
+        return f"kill_failed:{exc}"
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if not verify_sidecar_daemon_process(meta).get("ok"):
+            break
+        time.sleep(0.1)
+    clear_pid(DAEMON_PID_FILE)
+    clear_daemon_meta()
+    return "terminated"
 
 
 def ensure_daemon_token() -> str:
@@ -980,10 +1150,19 @@ def cmd_status(cfg: dict[str, Any], as_json: bool = False, **_: Any) -> int:
 def cmd_stop(cfg: dict[str, Any], **_: Any) -> int:
     del cfg
     stop_live_follow()
+    meta = read_daemon_meta()
+    if meta:
+        how = stop_existing_daemon_safe(meta)
+        print(f"[sidecar] daemon: {how}")
     stopped = False
     for label, path in (("daemon", DAEMON_PID_FILE), ("follow", PID_FILE)):
         pid = read_pid(path)
         if not pid:
+            continue
+        # Daemon already handled via metadata when possible
+        if label == "daemon" and meta:
+            clear_pid(path)
+            stopped = True
             continue
         try:
             os.kill(pid, signal.SIGTERM)
@@ -992,7 +1171,8 @@ def cmd_stop(cfg: dict[str, Any], **_: Any) -> int:
         except OSError as exc:
             print(f"[sidecar] could not stop {label}: {exc}")
         clear_pid(path)
-    if not stopped:
+    clear_daemon_meta()
+    if not stopped and not meta:
         print("[sidecar] nothing to stop")
     return 0
 
@@ -1049,6 +1229,16 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
                 path=body.get("path") or workspace or file_path,
                 focus=bool(body.get("focus", True)),
             )
+        elif cmd in ("shutdown-daemon", "shutdown_daemon"):
+            if not _DAEMON_MODE:
+                return {"ok": False, "cmd": cmd, "error": "not_daemon_process"}
+            # Respond first; shutdown asynchronously so the HTTP response can flush.
+            threading.Thread(
+                target=request_daemon_shutdown,
+                name="sidecar-shutdown-rpc",
+                daemon=True,
+            ).start()
+            return {"ok": True, "cmd": cmd, "shutting_down": True}
         elif cmd == "status":
             return {"ok": True, "cmd": cmd, "status": build_status(cfg)}
         else:
@@ -1068,7 +1258,7 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_daemon(cfg: dict[str, Any]) -> int:
-    global _DAEMON_MODE
+    global _DAEMON_MODE, _DAEMON_HTTP_SERVER
     _DAEMON_MODE = True
     if cfg.get("debug"):
         logging.basicConfig(level=logging.DEBUG)
@@ -1142,17 +1332,16 @@ def run_daemon(cfg: dict[str, Any]) -> int:
             self._send(200 if result.get("ok") else 500, result)
 
     server = ThreadingHTTPServer((host, port), Handler)
+    _DAEMON_HTTP_SERVER = server
     write_pid(os.getpid(), DAEMON_PID_FILE)
+    write_daemon_meta(pid=os.getpid(), host=host, port=port)
     http_thread = threading.Thread(target=server.serve_forever, name="sidecar-http", daemon=True)
     http_thread.start()
     _STOP_DAEMON.clear()
 
     def _stop(_sig: int, _frame: object) -> None:
         print("\n[sidecar] daemon stopping")
-        _STOP_DAEMON.set()
-        stop_live_follow()
-        server.shutdown()
-        clear_pid(DAEMON_PID_FILE)
+        request_daemon_shutdown()
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
@@ -1161,7 +1350,13 @@ def run_daemon(cfg: dict[str, Any]) -> int:
             time.sleep(0.25)
     finally:
         stop_live_follow()
+        try:
+            server.shutdown()
+        except Exception:
+            pass
         clear_pid(DAEMON_PID_FILE)
+        clear_daemon_meta()
+        _DAEMON_HTTP_SERVER = None
         _DAEMON_MODE = False
     return 0
 
@@ -1172,16 +1367,47 @@ def cmd_daemon(cfg: dict[str, Any], **_: Any) -> int:
 
 def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
     ensure_daemon_token()  # create token file before spawn
-    existing = read_pid(DAEMON_PID_FILE)
-    if existing:
-        try:
-            os.kill(existing, 0)
-            print(f"[sidecar] daemon already running pid={existing}")
-            return 0
-        except OSError:
-            clear_pid(DAEMON_PID_FILE)
     host = normalize_daemon_bind_host(str(cfg["daemon_host"]))
     port = int(cfg["daemon_port"])
+
+    meta = read_daemon_meta()
+    if not meta:
+        # Legacy: PID file only
+        existing = read_pid(DAEMON_PID_FILE)
+        if existing:
+            meta = {"pid": existing, "process_create_time": 0.0, "host": "", "port": 0}
+
+    if meta:
+        check = verify_sidecar_daemon_process(meta)
+        if check.get("ok"):
+            same_ep = (
+                normalize_daemon_bind_host(str(check.get("host") or meta.get("host") or ""))
+                == host
+                and int(check.get("port") or meta.get("port") or 0) == port
+            )
+            if same_ep:
+                print(f"[sidecar] daemon already running at requested endpoint http://{host}:{port}")
+                # Refresh meta if legacy pid-only
+                write_daemon_meta(
+                    pid=int(check["pid"]),
+                    host=host,
+                    port=port,
+                    process_create_time=float(check.get("process_create_time") or 0.0) or None,
+                )
+                write_pid(int(check["pid"]), DAEMON_PID_FILE)
+                return 0
+            print(
+                f"[sidecar] daemon endpoint mismatch "
+                f"(running {check.get('host')}:{check.get('port')} → requested {host}:{port}); migrating"
+            )
+            how = stop_existing_daemon_safe(meta)
+            print(f"[sidecar] old daemon: {how}")
+        else:
+            # Stale / PID reused by unrelated process — never kill; just clear our files
+            print(f"[sidecar] clearing stale daemon metadata ({check.get('reason')})")
+            clear_pid(DAEMON_PID_FILE)
+            clear_daemon_meta()
+
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
@@ -1200,8 +1426,14 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
         creationflags=creationflags,
         close_fds=True,
     )
-    time.sleep(0.5)
-    print(f"[sidecar] daemon-start http://{host}:{port} (auth token file ready)")
+    # Wait briefly for child to write meta
+    for _ in range(20):
+        time.sleep(0.15)
+        m = read_daemon_meta()
+        if m and int(m.get("port") or 0) == port:
+            print(f"[sidecar] daemon-start http://{host}:{port} (auth token file ready)")
+            return 0
+    print(f"[sidecar] daemon-start http://{host}:{port} (auth token file ready; meta pending)")
     return 0
 
 

@@ -1,6 +1,6 @@
 # cursor-obsidian
 
-**v0.4** — Live Sidecar + Context Bridge: open the current Obsidian note in the bound real Cursor Desktop Editor.
+**v0.4.1** — Live Sidecar + Context Bridge (hardened capability probe + daemon endpoint migration).
 
 Repo: https://github.com/hudengfenglai/cursor-obsidian
 

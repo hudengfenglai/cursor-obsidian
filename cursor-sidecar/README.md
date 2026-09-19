@@ -1,4 +1,4 @@
-# Cursor Sidecar v0.4 — Live Sidecar + Context Bridge
+# Cursor Sidecar v0.4.1 — Live Sidecar + Context Bridge
 
 Dock the **real Cursor Desktop** beside Obsidian on Windows, keep Cursor
 stuck to Obsidian’s right edge while attached, and open the current note
@@ -78,9 +78,9 @@ python acceptance_context_bridge.py
 ## Remaining limitations
 
 - When no usable space remains to the right of Obsidian, follow placement is constrained by the monitor work area.
-- Runtime Advanced daemon port changes while an old daemon is still alive may need a manual restart (v0.3.1 polish).
 - Context Bridge cannot 100% force a specific HWND; it focuses the bound window then uses `--reuse-window`.
-- Detached “Open in Cursor” is intentionally unsupported in v0.4.0.
+- Detached “Open in Cursor” is intentionally unsupported in v0.4.x.
+- Advanced daemon host/port changes are migrated automatically on next `ensureDaemon()` / `daemon-start` (v0.4.1).
 
 ## Out of scope
 

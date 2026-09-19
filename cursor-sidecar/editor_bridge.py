@@ -18,8 +18,17 @@ import psutil
 
 log = logging.getLogger("cursor_sidecar.editor_bridge")
 
-# Process-local capability cache: exe_path -> flags
-_CAP_CACHE: dict[str, dict[str, bool]] = {}
+# Process-local capability cache: "exe|mtime" -> caps
+_CAP_CACHE: dict[str, dict[str, Any]] = {}
+
+KNOWN_EDITOR_DEFAULTS: dict[str, Any] = {
+    "reuse_window": True,
+    "goto": True,
+    "classic": True,
+    "new_window": True,
+    "probed": False,
+    "source": "fallback",
+}
 
 
 def to_one_based_cursor(line_0: int | None, ch_0: int | None) -> tuple[int | None, int | None]:
@@ -90,22 +99,30 @@ def build_cursor_file_deeplink(
     return f"cursor://file/{loc}"
 
 
-def probe_editor_capabilities(cursor_exe: str, *, force: bool = False) -> dict[str, bool]:
+def _capability_cache_key(cursor_exe: str) -> str:
+    p = Path(cursor_exe)
+    try:
+        resolved = str(p.resolve())
+        mtime = int(p.stat().st_mtime_ns)
+    except OSError:
+        resolved = str(p)
+        mtime = 0
+    return f"{resolved}|{mtime}"
+
+
+def probe_editor_capabilities(cursor_exe: str, *, force: bool = False) -> dict[str, Any]:
     """
     Probe Desktop Editor launcher flags via `Cursor.exe --help`.
     Never calls agent / cursor-agent.
+
+    If --help succeeds with non-empty output: set flags strictly from that text.
+    If --help fails / empty: use known Desktop Editor fallback defaults.
     """
-    key = str(Path(cursor_exe))
+    key = _capability_cache_key(cursor_exe)
     if not force and key in _CAP_CACHE:
         return dict(_CAP_CACHE[key])
 
-    caps = {
-        "reuse_window": True,  # optimistic defaults for known Desktop Editor
-        "goto": True,
-        "classic": True,
-        "new_window": True,
-        "probed": False,
-    }
+    caps = dict(KNOWN_EDITOR_DEFAULTS)
     try:
         proc = subprocess.run(
             [cursor_exe, "--help"],
@@ -115,22 +132,21 @@ def probe_editor_capabilities(cursor_exe: str, *, force: bool = False) -> dict[s
             shell=False,
             check=False,
         )
-        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        lower = text.lower()
-        # Only flip to False when help clearly omits a flag we care about,
-        # if help is empty keep optimistic defaults.
-        if text.strip():
-            caps["probed"] = True
-            if "--reuse-window" in lower or "reuse-window" in lower:
-                caps["reuse_window"] = True
-            if "--goto" in lower or "goto" in lower:
-                caps["goto"] = True
-            if "--classic" in lower or "classic" in lower:
-                caps["classic"] = True
-            if "--new-window" in lower or "new-window" in lower:
-                caps["new_window"] = True
+        text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if text:
+            lower = text.lower()
+            caps = {
+                "reuse_window": "--reuse-window" in lower,
+                "goto": "--goto" in lower,
+                "classic": "--classic" in lower,
+                "new_window": "--new-window" in lower,
+                "probed": True,
+                "source": "help",
+            }
+        else:
+            log.info("editor --help empty — using fallback defaults")
     except (OSError, subprocess.SubprocessError, TimeoutError) as exc:
-        log.info("editor capability probe failed: %s — using defaults", exc)
+        log.info("editor capability probe failed: %s — using fallback defaults", exc)
 
     _CAP_CACHE[key] = dict(caps)
     return dict(caps)
@@ -270,6 +286,7 @@ class EditorBridge:
     ) -> dict[str, Any]:
         caps = probe_editor_capabilities(cursor_exe)
         attempts: list[tuple[str, list[str]]] = []
+        last_err: Exception | None = None
 
         if is_folder:
             folder = str(abs_path)
@@ -290,13 +307,22 @@ class EditorBridge:
                 )
             if caps.get("reuse_window") and caps.get("goto") and line is not None:
                 attempts.append(("exe_goto", ["--reuse-window", "--goto", location]))
+            # When --goto is unsupported but a line is requested, prefer deeplink
+            # for location fidelity before plain file opens.
+            if line is not None and not caps.get("goto"):
+                uri = build_cursor_file_deeplink(abs_path, line=line, column=column)
+                try:
+                    open_via_deeplink(uri)
+                    return {"ok": True, "method": "deeplink", "uri": uri}
+                except OSError as exc:
+                    last_err = exc
+                    log.info("deeplink (no-goto path) failed: %s", exc)
             if caps.get("classic") and caps.get("reuse_window"):
                 attempts.append(("exe_file", ["--classic", "--reuse-window", file_only]))
             if caps.get("reuse_window"):
                 attempts.append(("exe_file", ["--reuse-window", file_only]))
             attempts.append(("exe_file", [file_only]))
 
-        last_err: Exception | None = None
         for method, args in attempts:
             try:
                 open_via_executable(cursor_exe, args)
