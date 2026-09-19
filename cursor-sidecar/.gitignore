@@ -3,4 +3,8 @@ __pycache__/
 *.pyc
 .sidecar.pid
 .sidecar.daemon.pid
+.sidecar.daemon.token
 .sidecar.state.json
+.sidecar.state.corrupt
+*.state.corrupt
+tests/_tmp_atomic/

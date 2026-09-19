@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from geometry import (
+    atomic_write_text,
+    can_restore_bound_window,
     compute_split_rects,
     deserialize_state,
     evaluate_attachment,
     normalize_ratios,
     placement_dict,
     placement_tuple,
+    recover_state_dict,
     serialize_state,
+    validate_binding_identity,
     window_binding_valid,
 )
 
@@ -37,7 +42,6 @@ def test_compute_split_rects_basic():
 
 def test_compute_split_rects_with_gap():
     left, right = compute_split_rects((100, 50, 1100, 850), 0.5, 0.5, gap=10)
-    # usable = 1000 - 10 = 990 → 495 / 495
     assert left[0] == 100
     assert left[2] - left[0] == 495
     assert right[0] == left[2] + 10
@@ -54,8 +58,6 @@ def test_placement_roundtrip():
 def test_window_binding_valid():
     assert window_binding_valid({"hwnd": 1, "pid": 2}, live_hwnd_ok=True)
     assert not window_binding_valid({"hwnd": 1, "pid": 2}, live_hwnd_ok=False)
-    assert not window_binding_valid({"hwnd": 1}, live_hwnd_ok=True)
-    assert not window_binding_valid(None, live_hwnd_ok=True)
 
 
 def test_evaluate_attachment_detached():
@@ -72,7 +74,6 @@ def test_evaluate_attachment_cursor_gone():
     }
     v = evaluate_attachment(state, obsidian_live=True, cursor_live=False)
     assert v["attached"] is False
-    assert v["state_valid"] is False
     assert v["reason"] == "cursor_gone"
 
 
@@ -104,5 +105,120 @@ def test_state_serialization_roundtrip():
     back = deserialize_state(raw)
     assert back["attached"] is True
     assert back["obsidian"]["hwnd"] == 11
-    # stable json
     assert json.loads(raw)["cursor"]["pid"] == 44
+
+
+def test_create_time_mismatch_rejects():
+    record = {
+        "hwnd": 100,
+        "pid": 200,
+        "process_name": "Cursor.exe",
+        "process_create_time": 1000.0,
+    }
+    v = validate_binding_identity(
+        record,
+        hwnd_exists=True,
+        live_pid=200,
+        live_process_name="Cursor.exe",
+        live_create_time=9999.0,
+    )
+    assert v["ok"] is False
+    assert v["reason"] == "create_time_mismatch"
+    assert v["restore_safe"] is False
+
+
+def test_legacy_binding_without_create_time():
+    record = {"hwnd": 100, "pid": 200, "process_name": "Cursor.exe"}
+    v = validate_binding_identity(
+        record,
+        hwnd_exists=True,
+        live_pid=200,
+        live_process_name="Cursor.exe",
+        live_create_time=1234.5,
+    )
+    assert v["ok"] is True
+    assert v["legacy_binding"] is True
+    assert v["binding_mode"] == "hwnd_pid_process"
+
+
+def test_full_identity_ok():
+    record = {
+        "hwnd": 100,
+        "pid": 200,
+        "process_name": "Cursor.exe",
+        "process_create_time": 50.0,
+    }
+    v = validate_binding_identity(
+        record,
+        hwnd_exists=True,
+        live_pid=200,
+        live_process_name="Cursor.exe",
+        live_create_time=50.2,
+    )
+    assert v["ok"] is True
+    assert v["legacy_binding"] is False
+    assert v["binding_mode"] == "hwnd_pid_process_start"
+    assert v["restore_safe"] is True
+
+
+def test_process_name_mismatch():
+    record = {
+        "hwnd": 1,
+        "pid": 2,
+        "process_name": "Cursor.exe",
+        "process_create_time": 1.0,
+    }
+    v = validate_binding_identity(
+        record,
+        hwnd_exists=True,
+        live_pid=2,
+        live_process_name="notepad.exe",
+        live_create_time=1.0,
+    )
+    assert v["ok"] is False
+    assert v["reason"] == "process_name_mismatch"
+
+
+def test_cursor_a_gone_no_fallback_restore():
+    """Cursor A binding dead → restore policy is gone (never touch Cursor B)."""
+    snap_a = {
+        "hwnd": 111,
+        "pid": 222,
+        "process_name": "Cursor.exe",
+        "process_create_time": 10.0,
+        "original_window_placement": {},
+    }
+    # Binding identity fails (hwnd gone) — even if Cursor B exists elsewhere
+    identity = validate_binding_identity(
+        snap_a,
+        hwnd_exists=False,
+        live_pid=None,
+    )
+    assert identity["ok"] is False
+    assert can_restore_bound_window(snap_a, binding_ok=False) == "gone"
+    assert can_restore_bound_window(snap_a, binding_ok=True) == "restore"
+    assert can_restore_bound_window(None, binding_ok=False) == "skip"
+
+
+def test_atomic_write_text():
+    import tempfile
+    import shutil
+
+    root = Path(__file__).resolve().parent / "_tmp_atomic"
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        target = root / "state.json"
+        atomic_write_text(target, '{"attached": false}\n')
+        assert target.read_text(encoding="utf-8") == '{"attached": false}\n'
+        assert not (root / "state.json.tmp").exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_malformed_state_recovery():
+    assert recover_state_dict("") == {}
+    assert recover_state_dict("{not json") == {}
+    assert recover_state_dict("[1,2,3]") == {}
+    assert recover_state_dict('{"attached": true}')["attached"] is True

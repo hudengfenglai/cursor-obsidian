@@ -17,7 +17,6 @@ const DEFAULT_SETTINGS = {
   daemonHost: "127.0.0.1",
   daemonPort: 27845,
   useDaemon: false,
-  autoStartDaemon: false,
   openVaultInCursor: true,
   showNotices: true,
 };
@@ -117,10 +116,28 @@ class CursorSidecarPlugin extends Plugin {
     return this.app.vault.adapter.basePath;
   }
 
+  resolveDaemonToken() {
+    const dir = (this.settings.sidecarDir || "").trim();
+    if (!dir) return "";
+    const tokenPath = path.join(dir, ".sidecar.daemon.token");
+    try {
+      if (fs.existsSync(tokenPath)) {
+        return fs.readFileSync(tokenPath, "utf8").trim();
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    return "";
+  }
+
   async ensureDaemon() {
     if (await this.daemonHealthy()) return true;
     if (!this.pathsConfigured()) return false;
-    await this.spawnAsync(this.resolvePython(), [this.resolveMainPy(), "daemon-start"], this.settings.sidecarDir);
+    await this.spawnAsync(
+      this.resolvePython(),
+      [this.resolveMainPy(), "daemon-start"],
+      this.settings.sidecarDir
+    );
     for (let i = 0; i < 10; i++) {
       await sleep(200);
       if (await this.daemonHealthy()) return true;
@@ -137,7 +154,15 @@ class CursorSidecarPlugin extends Plugin {
   httpJson(method, urlPath, body) {
     const host = this.settings.daemonHost || "127.0.0.1";
     const port = Number(this.settings.daemonPort) || 27845;
+    const token = this.resolveDaemonToken();
     const payload = body ? JSON.stringify(body) : null;
+    const headers = {
+      "X-Cursor-Sidecar-Token": token,
+    };
+    if (payload) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(payload);
+    }
     return new Promise((resolve, reject) => {
       const req = http.request(
         {
@@ -145,18 +170,17 @@ class CursorSidecarPlugin extends Plugin {
           port,
           path: urlPath,
           method,
-          headers: payload
-            ? {
-                "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(payload),
-              }
-            : undefined,
+          headers,
           timeout: 20000,
         },
         (res) => {
           let data = "";
           res.on("data", (c) => (data += c));
           res.on("end", () => {
+            if (res.statusCode === 403) {
+              reject(new Error("daemon auth failed (403) — check .sidecar.daemon.token"));
+              return;
+            }
             try {
               resolve(JSON.parse(data || "{}"));
             } catch (e) {
@@ -326,8 +350,8 @@ class CursorSidecarSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Use daemon (optional)")
-      .setDesc("Off by default in v0.2. Prefer direct CLI for Attach/Detach.")
+      .setName("Use daemon (experimental)")
+      .setDesc("Off by default. Requires .sidecar.daemon.token; no browser CORS.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.useDaemon).onChange(async (value) => {
           this.plugin.settings.useDaemon = value;

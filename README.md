@@ -1,12 +1,7 @@
 # cursor-obsidian
 
-**v0.2 — Sidecar Lifecycle:** Attach / Detach with full window restore.
+**v0.2.1** — Attach/Detach lifecycle with restore safety hardening.
 
 Repo: https://github.com/hudengfenglai/cursor-obsidian
-
-```text
-First click  → Attach (70/30)
-Second click → Detach (restore maximized/normal placements)
-```
 
 See `cursor-sidecar/README.md`.

@@ -105,20 +105,78 @@ def get_window_rect(hwnd: int) -> Rect:
     return Rect(left, top, right, bottom)
 
 
-def is_same_window(hwnd: int, pid: int) -> bool:
-    """Validate HWND still belongs to the expected PID."""
+def is_same_window(
+    hwnd: int,
+    pid: int,
+    process_name: str | None = None,
+    process_create_time: float | None = None,
+) -> bool:
+    """Validate HWND still belongs to the expected process identity."""
+    record = {
+        "hwnd": hwnd,
+        "pid": pid,
+        "process_name": process_name,
+        "process_create_time": process_create_time,
+    }
+    # Drop None identity fields so legacy path works when omitted
+    if process_name is None:
+        record.pop("process_name")
+    if process_create_time is None:
+        record.pop("process_create_time")
+    return bool(validate_window_binding(record)["ok"])
+
+
+def get_process_identity(pid: int) -> dict[str, Any]:
     try:
-        hwnd_i = int(hwnd)
-        pid_i = int(pid)
+        proc = psutil.Process(int(pid))
+        return {
+            "process_name": proc.name(),
+            "process_create_time": float(proc.create_time()),
+        }
+    except (psutil.Error, ValueError, TypeError):
+        return {"process_name": "", "process_create_time": None}
+
+
+def validate_window_binding(record: dict[str, Any] | None) -> dict[str, Any]:
+    """Platform binding check: HWND + PID + process name + create_time."""
+    from geometry import validate_binding_identity
+
+    if not record:
+        return validate_binding_identity(
+            None, hwnd_exists=False, live_pid=None
+        )
+
+    try:
+        hwnd_i = int(record.get("hwnd") or 0)
+        pid_i = int(record.get("pid") or 0)
     except (TypeError, ValueError):
-        return False
-    if not hwnd_i or not win32gui.IsWindow(hwnd_i):
-        return False
-    try:
-        _, actual = win32process.GetWindowThreadProcessId(hwnd_i)
-        return int(actual) == pid_i
-    except Exception:
-        return False
+        return validate_binding_identity(
+            {"hwnd": "x", "pid": "y"}, hwnd_exists=False, live_pid=None
+        )
+
+    hwnd_exists = bool(hwnd_i and win32gui.IsWindow(hwnd_i))
+    live_pid: int | None = None
+    live_name: str | None = None
+    live_ctime: float | None = None
+
+    if hwnd_exists:
+        try:
+            _, live_pid = win32process.GetWindowThreadProcessId(hwnd_i)
+            live_pid = int(live_pid)
+            ident = get_process_identity(live_pid)
+            live_name = ident.get("process_name") or None
+            live_ctime = ident.get("process_create_time")
+        except Exception:
+            hwnd_exists = False
+            live_pid = None
+
+    return validate_binding_identity(
+        record,
+        hwnd_exists=hwnd_exists,
+        live_pid=live_pid,
+        live_process_name=live_name,
+        live_create_time=live_ctime,
+    )
 
 
 def window_info_from_hwnd(hwnd: int) -> Optional[WindowInfo]:
@@ -246,15 +304,19 @@ def resolve_bound_window(
     title_hint: str = "",
     *,
     allow_hidden: bool = False,
+    allow_rediscovery: bool = True,
 ) -> Optional[WindowInfo]:
-    """Prefer previously bound HWND+PID; rediscover only if stale."""
+    """Prefer previously bound HWND+PID(+identity); rediscover only if allowed."""
     if binding:
-        hwnd = int(binding.get("hwnd") or 0)
-        pid = int(binding.get("pid") or 0)
-        if is_same_window(hwnd, pid):
-            info = window_info_from_hwnd(hwnd)
+        check = validate_window_binding(binding)
+        if check["ok"]:
+            info = window_info_from_hwnd(int(binding["hwnd"]))
             if info:
                 return info
+        if not allow_rediscovery:
+            return None
+    if not allow_rediscovery:
+        return None
     if allow_hidden and _normalize(process_name) == "cursor":
         return find_cursor_hwnd_any(process_name, title_hint)
     return pick_best_window(find_windows_by_process(process_name), title_hint)
@@ -306,9 +368,13 @@ def snapshot_window(hwnd: int) -> dict[str, Any]:
     """Full original state for Attach → Detach restore."""
     placement = win32gui.GetWindowPlacement(hwnd)
     flags, show_cmd, min_pos, max_pos, normal = placement
+    pid = int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    ident = get_process_identity(pid)
     return {
         "hwnd": int(hwnd),
-        "pid": int(win32process.GetWindowThreadProcessId(hwnd)[1]),
+        "pid": pid,
+        "process_name": ident.get("process_name") or _process_name(pid),
+        "process_create_time": ident.get("process_create_time"),
         "title": win32gui.GetWindowText(hwnd),
         "original_rect": list(get_window_rect(hwnd).as_tuple()),
         "original_window_placement": placement_dict(

@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from geometry import evaluate_attachment, normalize_ratios
+from geometry import (
+    atomic_write_text,
+    can_restore_bound_window,
+    evaluate_attachment,
+    normalize_ratios,
+    recover_state_dict,
+)
 from window import (
     apply_window_placement,
     arrange_bound_windows,
@@ -24,12 +30,12 @@ from window import (
     find_obsidian_window,
     focus_window,
     is_process_running,
-    is_same_window,
     launch_process,
     resolve_bound_window,
     resolve_cursor_exe,
     snapshot_window,
     toggle_cursor_visibility,
+    validate_window_binding,
     wait_for_window,
     window_info_from_hwnd,
 )
@@ -38,9 +44,10 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
 PID_FILE = ROOT / ".sidecar.pid"
 DAEMON_PID_FILE = ROOT / ".sidecar.daemon.pid"
+TOKEN_FILE = ROOT / ".sidecar.daemon.token"
 STATE_FILE = ROOT / ".sidecar.state.json"
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -65,14 +72,25 @@ def read_state() -> dict[str, Any]:
     if not STATE_FILE.is_file():
         return {}
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
+        raw = STATE_FILE.read_text(encoding="utf-8")
+    except OSError:
         return {}
+    data = recover_state_dict(raw)
+    if not data and raw.strip():
+        # Malformed leftover — quarantine
+        try:
+            bad = STATE_FILE.with_suffix(".state.corrupt")
+            os.replace(STATE_FILE, bad)
+        except OSError:
+            pass
+    return data
 
 
 def write_state(data: dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(
+        STATE_FILE,
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 def clear_attached_state(keep_file: bool = True) -> None:
@@ -83,7 +101,6 @@ def clear_attached_state(keep_file: bool = True) -> None:
     state = read_state()
     state["attached"] = False
     state["timestamp"] = time.time()
-    # Keep originals for debugging but mark detached
     write_state(state)
 
 
@@ -97,7 +114,7 @@ def read_pid(path: Path = PID_FILE) -> int | None:
 
 
 def write_pid(pid: int, path: Path = PID_FILE) -> None:
-    path.write_text(str(pid), encoding="utf-8")
+    atomic_write_text(path, str(pid) + "\n")
 
 
 def clear_pid(path: Path = PID_FILE) -> None:
@@ -105,10 +122,25 @@ def clear_pid(path: Path = PID_FILE) -> None:
         path.unlink()
 
 
+def ensure_daemon_token() -> str:
+    """Load or create daemon auth token (never log the full value)."""
+    import secrets
+
+    if TOKEN_FILE.is_file():
+        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    atomic_write_text(TOKEN_FILE, token + "\n")
+    return token
+
+
 def binding_live(record: dict[str, Any] | None) -> bool:
-    if not record:
-        return False
-    return is_same_window(int(record.get("hwnd") or 0), int(record.get("pid") or 0))
+    return bool(validate_window_binding(record)["ok"])
+
+
+def binding_report(record: dict[str, Any] | None) -> dict[str, Any]:
+    return validate_window_binding(record)
 
 
 def refresh_attachment_truth(state: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -274,7 +306,8 @@ def cmd_attach(
 
 
 def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
-    """Detach Sidecar and restore original WindowPlacement for both apps."""
+    """Detach Sidecar and restore original WindowPlacement for bound windows only."""
+    del cfg  # process names unused — never rediscover by process
     truth = refresh_attachment_truth()
     state = truth["state"]
     if not state.get("obsidian") and not state.get("cursor"):
@@ -282,7 +315,6 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
         write_state({"attached": False, "timestamp": time.time(), "version": VERSION})
         return 0
 
-    # Stop follow if any (v0.3 will own daemon lifecycle)
     follow = read_pid(PID_FILE)
     if follow:
         try:
@@ -294,22 +326,20 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
     obs_snap = state.get("obsidian") or {}
     cur_snap = state.get("cursor") or {}
 
-    def _restore(snap: dict[str, Any], process_name: str, label: str) -> str:
-        if not snap:
+    def _restore(snap: dict[str, Any]) -> str:
+        """Restore only the exact bound HWND. Never soft-rediscover another window."""
+        check = validate_window_binding(snap if snap else None)
+        decision = can_restore_bound_window(snap, binding_ok=bool(check.get("ok")))
+        if decision == "skip":
             return "skip"
-        hwnd = int(snap.get("hwnd") or 0)
-        pid = int(snap.get("pid") or 0)
-        if not is_same_window(hwnd, pid):
-            # Soft rediscovery by process — still try placement if we find a window
-            found = resolve_bound_window(None, process_name, allow_hidden=True)
-            if not found:
-                return "gone"
-            hwnd = found.hwnd
+        if decision == "gone":
+            return "gone"
+        hwnd = int(snap["hwnd"])
         ok = apply_window_placement(hwnd, snap)
         return "ok" if ok else "fail"
 
-    r_obs = _restore(obs_snap, cfg["obsidian_process"], "obsidian")
-    r_cur = _restore(cur_snap, cfg["cursor_process"], "cursor")
+    r_obs = _restore(obs_snap)
+    r_cur = _restore(cur_snap)
 
     write_state(
         {
@@ -320,7 +350,6 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
                 "obsidian": r_obs,
                 "cursor": r_cur,
             },
-            # Keep last originals for debugging; not active
             "obsidian": obs_snap,
             "cursor": cur_snap,
         }
@@ -455,8 +484,36 @@ def cmd_open(
 def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
     truth = refresh_attachment_truth()
     state = truth["state"]
-    obs_live = binding_live(state.get("obsidian"))
-    cur_live = binding_live(state.get("cursor"))
+    obs_rep = binding_report(state.get("obsidian"))
+    cur_rep = binding_report(state.get("cursor"))
+    obs_live = bool(obs_rep.get("ok"))
+    cur_live = bool(cur_rep.get("ok"))
+
+    legacy = bool(obs_rep.get("legacy_binding") or cur_rep.get("legacy_binding"))
+    # Prefer cursor binding mode when attached; else best available
+    if cur_rep.get("binding_mode") and cur_rep.get("binding_mode") not in ("none", "invalid"):
+        binding_mode = cur_rep.get("binding_mode")
+    else:
+        binding_mode = obs_rep.get("binding_mode") or "none"
+
+    restore_safe = bool(
+        (not state.get("attached") and truth["reason"] == "detached")
+        or (
+            obs_rep.get("restore_safe")
+            and cur_rep.get("restore_safe")
+            and truth["attached"]
+        )
+        or (
+            # Detach path: restore is safe only for windows still bound
+            (not truth["attached"])
+            and truth["reason"] != "detached"
+        )
+    )
+    # Clearer: restore_safe means "if you detach now, you will only touch exact HWNDs"
+    if truth["attached"]:
+        restore_safe = bool(obs_rep.get("ok") and cur_rep.get("ok"))
+    else:
+        restore_safe = True  # nothing to restore / already detached
 
     obs_info = None
     if obs_live:
@@ -513,6 +570,19 @@ def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
         "attached": truth["attached"],
         "state_valid": truth["state_valid"],
         "reason": truth["reason"],
+        "binding_mode": binding_mode,
+        "legacy_binding": legacy,
+        "restore_safe": restore_safe,
+        "obsidian_binding": {
+            "ok": obs_live,
+            "legacy_binding": bool(obs_rep.get("legacy_binding")),
+            "reason": obs_rep.get("reason"),
+        },
+        "cursor_binding": {
+            "ok": cur_live,
+            "legacy_binding": bool(cur_rep.get("legacy_binding")),
+            "reason": cur_rep.get("reason"),
+        },
         "obsidian": obs_info,
         "cursor": cur_info,
         "cursor_running": is_process_running(cfg["cursor_process"]),
@@ -611,28 +681,43 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
 
 def run_daemon(cfg: dict[str, Any]) -> int:
     host, port = cfg["daemon_host"], cfg["daemon_port"]
+    expected_token = ensure_daemon_token()
+    print(f"[sidecar] daemon http://{host}:{port} (token file present; auth required)")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
-            print(f"[daemon] {fmt % args}")
+            # Avoid logging Authorization headers / tokens
+            print(f"[daemon] {self.command} {self.path} →")
+            try:
+                print(f"[daemon]   {fmt % args}")
+            except Exception:
+                pass
+
+        def _authorized(self) -> bool:
+            got = self.headers.get("X-Cursor-Sidecar-Token") or ""
+            return bool(got) and got == expected_token
 
         def _send(self, code: int, payload: dict[str, Any]) -> None:
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # No Access-Control-Allow-Origin — localhost RPC is not for browsers
             self.end_headers()
             self.wfile.write(raw)
 
+        def _forbid(self) -> None:
+            self._send(403, {"ok": False, "error": "forbidden"})
+
         def do_OPTIONS(self) -> None:  # noqa: N802
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            # Do not advertise CORS wildcard
+            self.send_response(405)
             self.end_headers()
 
         def do_GET(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._forbid()
+                return
             path = urlparse(self.path).path
             if path in ("/", "/health"):
                 self._send(200, {"ok": True, "service": "cursor-sidecar", "version": VERSION})
@@ -643,6 +728,9 @@ def run_daemon(cfg: dict[str, Any]) -> int:
             self._send(404, {"ok": False, "error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._forbid()
+                return
             if urlparse(self.path).path not in ("/rpc", "/"):
                 self._send(404, {"ok": False, "error": "not found"})
                 return
@@ -658,7 +746,6 @@ def run_daemon(cfg: dict[str, Any]) -> int:
 
     server = ThreadingHTTPServer((host, port), Handler)
     write_pid(os.getpid(), DAEMON_PID_FILE)
-    print(f"[sidecar] daemon http://{host}:{port}")
 
     def _stop(_sig: int, _frame: object) -> None:
         clear_pid(DAEMON_PID_FILE)
@@ -678,6 +765,7 @@ def cmd_daemon(cfg: dict[str, Any], **_: Any) -> int:
 
 
 def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
+    ensure_daemon_token()  # create token file before spawn
     existing = read_pid(DAEMON_PID_FILE)
     if existing:
         try:
@@ -698,7 +786,7 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
         close_fds=True,
     )
     time.sleep(0.5)
-    print(f"[sidecar] daemon-start port={cfg['daemon_port']}")
+    print(f"[sidecar] daemon-start port={cfg['daemon_port']} (auth token file ready)")
     return 0
 
 

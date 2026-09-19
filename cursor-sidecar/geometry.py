@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 
@@ -65,27 +68,136 @@ def placement_tuple(data: dict[str, Any]) -> tuple:
 
 
 def is_maximized_show_cmd(show_cmd: int) -> bool:
-    # SW_SHOWMAXIMIZED = 3
     return int(show_cmd) == 3
 
 
 def is_minimized_show_cmd(show_cmd: int) -> bool:
-    # SW_SHOWMINIMIZED = 2, SW_MINIMIZE = 6
     return int(show_cmd) in (2, 6)
 
 
-def window_binding_valid(record: dict[str, Any] | None, *, live_hwnd_ok: bool) -> bool:
-    """Pure check: binding record shape + optional live hwnd flag from platform layer."""
+def _norm_proc(name: str | None) -> str:
+    if not name:
+        return ""
+    return name.lower().removesuffix(".exe")
+
+
+def validate_binding_identity(
+    record: dict[str, Any] | None,
+    *,
+    hwnd_exists: bool,
+    live_pid: int | None,
+    live_process_name: str | None = None,
+    live_create_time: float | None = None,
+    create_time_tolerance: float = 1.0,
+) -> dict[str, Any]:
+    """
+    Pure binding check given live process facts from the platform layer.
+
+    Returns ok / legacy_binding / restore_safe / binding_mode / reason.
+    """
     if not record:
-        return False
-    if "hwnd" not in record or "pid" not in record:
-        return False
+        return {
+            "ok": False,
+            "legacy_binding": False,
+            "restore_safe": False,
+            "binding_mode": "none",
+            "reason": "missing_record",
+        }
+
     try:
-        int(record["hwnd"])
-        int(record["pid"])
-    except (TypeError, ValueError):
-        return False
-    return bool(live_hwnd_ok)
+        expected_hwnd = int(record["hwnd"])
+        expected_pid = int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "ok": False,
+            "legacy_binding": False,
+            "restore_safe": False,
+            "binding_mode": "invalid",
+            "reason": "bad_hwnd_pid",
+        }
+
+    if not hwnd_exists:
+        return {
+            "ok": False,
+            "legacy_binding": "process_create_time" not in record,
+            "restore_safe": False,
+            "binding_mode": "hwnd_gone",
+            "reason": "hwnd_gone",
+        }
+
+    if live_pid is None or int(live_pid) != expected_pid:
+        return {
+            "ok": False,
+            "legacy_binding": "process_create_time" not in record,
+            "restore_safe": False,
+            "binding_mode": "pid_mismatch",
+            "reason": "pid_mismatch",
+        }
+
+    has_name = bool(record.get("process_name"))
+    has_ctime = record.get("process_create_time") is not None
+    legacy = not has_ctime
+
+    if has_name and live_process_name is not None:
+        if _norm_proc(str(record["process_name"])) != _norm_proc(live_process_name):
+            return {
+                "ok": False,
+                "legacy_binding": legacy,
+                "restore_safe": False,
+                "binding_mode": "process_name_mismatch",
+                "reason": "process_name_mismatch",
+            }
+
+    if has_ctime:
+        if live_create_time is None:
+            return {
+                "ok": False,
+                "legacy_binding": False,
+                "restore_safe": False,
+                "binding_mode": "hwnd_pid_process_start",
+                "reason": "create_time_unavailable",
+            }
+        expected_ct = float(record["process_create_time"])
+        if abs(float(live_create_time) - expected_ct) > create_time_tolerance:
+            return {
+                "ok": False,
+                "legacy_binding": False,
+                "restore_safe": False,
+                "binding_mode": "hwnd_pid_process_start",
+                "reason": "create_time_mismatch",
+            }
+        mode = "hwnd_pid_process_start"
+    elif has_name:
+        mode = "hwnd_pid_process"
+    else:
+        mode = "hwnd_pid"
+
+    return {
+        "ok": True,
+        "legacy_binding": legacy,
+        "restore_safe": True,  # exact HWND match — never fallback to another window
+        "binding_mode": mode,
+        "reason": "ok",
+        "hwnd": expected_hwnd,
+        "pid": expected_pid,
+    }
+
+
+def can_restore_bound_window(
+    snap: dict[str, Any] | None,
+    *,
+    binding_ok: bool,
+) -> str:
+    """
+    Detach restore policy (no soft rediscovery).
+
+    Returns: skip | gone | restore
+    """
+    if not snap:
+        return "skip"
+    if not binding_ok:
+        return "gone"
+    return "restore"
 
 
 def evaluate_attachment(
@@ -94,14 +206,6 @@ def evaluate_attachment(
     obsidian_live: bool,
     cursor_live: bool,
 ) -> dict[str, Any]:
-    """
-    Decide whether state should still count as attached.
-
-    Returns:
-      attached: effective attachment
-      state_valid: bindings look coherent
-      reason: short code
-    """
     claimed = bool(state.get("attached"))
     if not claimed:
         return {
@@ -127,7 +231,6 @@ def evaluate_attachment(
             "reason": "both_windows_gone",
         }
 
-    # Spec D: if Cursor manually closed, must not stay attached=true
     if not cursor_live:
         return {
             "attached": False,
@@ -149,16 +252,50 @@ def evaluate_attachment(
     }
 
 
-def serialize_state(state: dict[str, Any]) -> str:
-    import json
+def window_binding_valid(record: dict[str, Any] | None, *, live_hwnd_ok: bool) -> bool:
+    if not record:
+        return False
+    if "hwnd" not in record or "pid" not in record:
+        return False
+    try:
+        int(record["hwnd"])
+        int(record["pid"])
+    except (TypeError, ValueError):
+        return False
+    return bool(live_hwnd_ok)
 
+
+def serialize_state(state: dict[str, Any]) -> str:
     return json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True)
 
 
 def deserialize_state(raw: str) -> dict[str, Any]:
-    import json
-
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("state must be an object")
+    return data
+
+
+def atomic_write_text(path: Path | str, text: str) -> None:
+    """Write via temp file + os.replace to avoid truncated JSON on crash."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+
+
+def recover_state_dict(raw: str | None) -> dict[str, Any]:
+    """Malformed / empty state → empty dict (safe detached)."""
+    if not raw or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
     return data

@@ -3,6 +3,8 @@ cursor-sidecar/__pycache__/
 cursor-sidecar/*.pyc
 cursor-sidecar/.sidecar.pid
 cursor-sidecar/.sidecar.daemon.pid
+cursor-sidecar/.sidecar.daemon.token
 cursor-sidecar/.sidecar.state.json
+cursor-sidecar/*.state.corrupt
 .DS_Store
 Thumbs.db
