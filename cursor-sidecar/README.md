@@ -39,6 +39,9 @@ node --check ../obsidian-plugin/main.js
 
 `cursor-sidecar/acceptance_run.py` is a **Windows-only** acceptance harness (not a CI unit test).
 
+It refuses to run if Sidecar is currently **attached** (will not overwrite live restore state).  
+On exit it restores the exact Obsidian/Cursor placements captured at start, and restores `.sidecar.state.json`.
+
 It checks:
 
 - maximize → attach → detach restore
@@ -52,7 +55,7 @@ It checks:
 python acceptance_run.py
 ```
 
-Requires Obsidian and Cursor Desktop windows to be open.
+Requires Obsidian and Cursor Desktop windows to be open, with Sidecar detached.
 
 ## Out of scope
 
