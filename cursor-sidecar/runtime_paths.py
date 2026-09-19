@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "0.6.0"
+VERSION = "0.7.1-dev"
 
 DEFAULT_CONFIG_VALUES: dict[str, Any] = {
     "preset": "normal",
@@ -30,6 +30,10 @@ DEFAULT_CONFIG_VALUES: dict[str, Any] = {
     "daemon_host": "127.0.0.1",
     "daemon_port": 27845,
     "launch_cursor_if_missing": True,
+    "embed_borderless": False,
+    "experimental_owned_window": False,
+    "native_child_experiment": False,
+    "embed_backend": "visual",
     "cursor_exe_candidates": [
         r"%LOCALAPPDATA%\Programs\cursor\Cursor.exe",
         r"%LOCALAPPDATA%\cursor\Cursor.exe",

@@ -1,9 +1,9 @@
 {
   "id": "cursor-sidecar",
   "name": "Cursor Sidecar",
-  "version": "0.6.0",
+  "version": "0.7.1-dev",
   "minAppVersion": "1.5.0",
-  "description": "Context Follow: silently keep Cursor on the active Obsidian file while attached (v0.6).",
+  "description": "v0.7.1-dev Auto Native Agents Pane (SetParent + auto-launch Agents Window).",
   "author": "hudengfenglai",
   "authorUrl": "https://github.com/hudengfenglai/cursor-obsidian",
   "isDesktopOnly": true

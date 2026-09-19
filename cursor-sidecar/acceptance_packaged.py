@@ -109,7 +109,10 @@ def main() -> int:
     try:
         # A. --version
         ver = run_exe(exe, data_a, "--version")
-        record("A.version", ver.returncode == 0 and ver.stdout.strip() == "0.6.0", ver.stdout.strip())
+        if ver.returncode == 0 and ver.stdout.strip() == "0.7.1-dev":
+            record("A.version", True, ver.stdout.strip())
+        else:
+            record("A.version", False, ver.stdout.strip())
 
         # B. status
         st = run_exe(exe, data_a, "status", "--json")

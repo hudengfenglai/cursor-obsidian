@@ -93,6 +93,13 @@ class LiveFollowService:
         self._suppress_until = 0.0
         self._cursor_hidden_for_minimize = False
 
+        # "sidecar" = right-edge follow (editor); "pane" = visual embed (agent HWND)
+        self.follow_mode: str = "sidecar"
+        self.last_pane_dom: dict[str, Any] | None = None
+        self.last_embed_apply: dict[str, Any] | None = None
+        self.agent_hwnd: int = 0
+        self.embed_backend: str = "visual"
+
         self.last_event = ""
         self.last_follow_at = 0.0
         self.hook_installed = False
@@ -113,7 +120,25 @@ class LiveFollowService:
             "last_follow_at": self.last_follow_at or None,
             "obsidian_hwnd": self.obsidian_hwnd or None,
             "cursor_hwnd": self.cursor_hwnd or None,
+            "agent_hwnd": self.agent_hwnd or None,
+            "follow_mode": self.follow_mode,
+            "embed_backend": self.embed_backend,
+            "has_pane_dom": bool(self.last_pane_dom),
         }
+
+    def set_follow_mode(self, mode: str) -> None:
+        m = str(mode or "sidecar").strip().lower()
+        self.follow_mode = "pane" if m == "pane" else "sidecar"
+
+    def set_last_pane_dom(self, pane: dict[str, Any] | None) -> None:
+        self.last_pane_dom = dict(pane) if isinstance(pane, dict) else None
+
+    def set_agent_hwnd(self, hwnd: int) -> None:
+        self.agent_hwnd = int(hwnd or 0)
+
+    def set_embed_backend(self, backend: str) -> None:
+        b = str(backend or "visual").strip().lower()
+        self.embed_backend = "native_child" if b in ("native_child", "native") else "visual"
 
     def start(self, obsidian_hwnd: int, cursor_hwnd: int, cursor_width: int) -> None:
         if not self.enabled:
@@ -307,6 +332,15 @@ class LiveFollowService:
 
     def _handle_obsidian_gone(self) -> None:
         log.info("bound Obsidian destroyed — stopping live follow")
+        # Best-effort: if agent was native-child, detach before parent dies
+        if self.embed_backend == "native_child" and self.agent_hwnd:
+            try:
+                from native_embed import exit_native_child
+
+                # Snapshot may live in process state; try NULL parent restore
+                exit_native_child(agent_hwnd=self.agent_hwnd, snapshot=None)
+            except Exception as exc:
+                log.warning("native child emergency detach: %s", exc)
         try:
             self._mark_stale("obsidian_gone")
         except Exception as exc:
@@ -356,6 +390,9 @@ class LiveFollowService:
     def _follow_cursor(self, reason: str = "") -> None:
         if self._stop.is_set() or not self.enabled:
             return
+        if self.follow_mode == "pane":
+            self._follow_embedded_pane(reason=reason)
+            return
         with self._lock:
             ok, why = self._bindings_ok()
             if not ok:
@@ -392,5 +429,62 @@ class LiveFollowService:
                     log.debug("follow[%s] -> %s", reason, target)
             except Exception as exc:
                 log.error("follow error: %s", exc)
+            finally:
+                self._self_applying = False
+
+    def _follow_embedded_pane(self, reason: str = "") -> None:
+        """Recompute pane screen rect; move agent_hwnd only (never editor)."""
+        with self._lock:
+            ok, why = self._bindings_ok()
+            if not ok:
+                if why == "cursor_gone":
+                    self._handle_cursor_gone()
+                elif why == "obsidian_gone":
+                    self._handle_obsidian_gone()
+                return
+            pane = self.last_pane_dom
+            if not isinstance(pane, dict):
+                return
+            target = int(self.agent_hwnd or 0)
+            if not target:
+                # No agent bound — do not fall back to editor HWND
+                return
+            try:
+                if win32gui.IsIconic(self.obsidian_hwnd):
+                    return
+                if not win32gui.IsWindow(target):
+                    log.info("agent hwnd gone during embed follow")
+                    self.agent_hwnd = 0
+                    return
+                self._self_applying = True
+                self._suppress_until = time.time() + 0.2
+                if self.embed_backend == "native_child":
+                    from native_embed import update_native_child
+
+                    mapped = update_native_child(
+                        agent_hwnd=target,
+                        obsidian_hwnd=self.obsidian_hwnd,
+                        pane=pane,
+                    )
+                else:
+                    from embedded_window import apply_embedded_pane
+
+                    mapped = apply_embedded_pane(
+                        obsidian_hwnd=self.obsidian_hwnd,
+                        cursor_hwnd=target,
+                        pane=pane,
+                    )
+                self.last_embed_apply = mapped
+                self.last_follow_at = time.time()
+                if self.debug:
+                    log.debug(
+                        "embed-follow[%s] backend=%s agent=%s -> %s",
+                        reason,
+                        self.embed_backend,
+                        target,
+                        mapped.get("client_rect") or mapped.get("screen_rect"),
+                    )
+            except Exception as exc:
+                log.error("embed follow error: %s", exc)
             finally:
                 self._self_applying = False

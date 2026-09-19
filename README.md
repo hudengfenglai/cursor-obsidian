@@ -1,8 +1,8 @@
 # cursor-obsidian
 
-**v0.6.0** — Context Follow (silent active-file sync) on top of zero-config Windows packaging.
+**v0.6.0** stable — Context Follow + packaged Windows helper.
 
-Stable baseline: **v0.5.0** (`bf63d6d`).
+**v0.7.0-dev** (`experiment/embedded-pane`) — Embedded Pane Phase 1 (visual embed via `SetWindowPos`; no `SetParent`).
 
 Repo: https://github.com/hudengfenglai/cursor-obsidian
 

@@ -1,3 +1,14 @@
 .cursor-sidecar-notice {
   font-family: var(--font-interface);
 }
+
+/* Verified native_child: empty ItemView host so Win32 child paints into pane client area */
+.cursor-sidecar-pane.is-native-anchor {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+.cursor-sidecar-pane.is-native-anchor .cursor-sidecar-pane-host {
+  opacity: 0;
+  pointer-events: none;
+}

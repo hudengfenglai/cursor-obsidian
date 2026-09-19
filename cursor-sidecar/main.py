@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cursor Sidecar v0.6 — Live Sidecar + Context Bridge + Context Follow."""
+"""Cursor Sidecar v0.7-dev — Live Sidecar + Context Follow + Embedded Pane experiment."""
 
 from __future__ import annotations
 
@@ -31,6 +31,36 @@ from geometry import (
 )
 from context_follow import ContextFollowGate, is_excluded_rel_path, is_path_inside_vault
 from context_sync import ContextSyncController, SyncJob, next_context_sync_seq
+from cursor_windows import (
+    agent_binding_ok,
+    agent_hwnd,
+    bind_agent_from_hwnd,
+    candidates_excluding_editor,
+    clear_agent_binding,
+    diff_new_hwnds,
+    editor_binding_ok,
+    editor_hwnd,
+    get_agent_binding,
+    get_editor_binding,
+    list_cursor_top_level,
+    migrate_cursor_roles,
+)
+from embedded_window import (
+    apply_borderless,
+    apply_embedded_pane,
+    restore_window_chrome,
+    set_owner_experimental,
+    snapshot_window_chrome,
+)
+from native_embed import (
+    enter_native_child,
+    exit_native_child,
+    probe_hwnd_win32,
+    recover_native_child,
+    update_native_child,
+)
+from agents_auto import ensure_agents_window_bound
+from pane_geometry import DomPaneRect
 from runtime_paths import (
     DEFAULT_CONFIG_VALUES,
     VERSION,
@@ -167,6 +197,12 @@ def load_config(path: Path) -> dict[str, Any]:
     cfg["live_follow"] = bool(cfg.get("live_follow", True))
     cfg["follow_debounce_ms"] = int(cfg.get("follow_debounce_ms", 40))
     cfg["debug"] = bool(cfg.get("debug", False))
+    # Embedded Pane experiment (Phase 1 visual embed — defaults OFF)
+    cfg["embed_borderless"] = bool(cfg.get("embed_borderless", False))
+    cfg["experimental_owned_window"] = bool(cfg.get("experimental_owned_window", False))
+    cfg["native_child_experiment"] = bool(cfg.get("native_child_experiment", False))
+    backend = str(cfg.get("embed_backend") or "visual").strip().lower()
+    cfg["embed_backend"] = "native_child" if backend in ("native_child", "native") else "visual"
     return cfg
 
 
@@ -202,6 +238,8 @@ def read_state() -> dict[str, Any]:
             os.replace(STATE_FILE, bad)
         except OSError:
             pass
+    if data:
+        migrate_cursor_roles(data)
     return data
 
 
@@ -526,7 +564,31 @@ def start_live_follow_if_daemon(cfg: dict[str, Any], state: dict[str, Any]) -> N
         work = get_work_area_for_hwnd(int(obs["hwnd"])).as_tuple()
         width = cursor_width_from_work(work, float(cfg["cursor_ratio"]), int(cfg.get("gap", 0)))
     svc = ensure_live_follow_service(cfg)
+    prev_pane = getattr(svc, "last_pane_dom", None)
     svc.start(int(obs["hwnd"]), int(cur["hwnd"]), width)
+    if state.get("embedded") and str(state.get("embed_mode") or "") == "pane":
+        svc.set_follow_mode("pane")
+        pane = state.get("last_pane_dom")
+        if isinstance(pane, dict):
+            svc.set_last_pane_dom(pane)
+        elif isinstance(prev_pane, dict):
+            svc.set_last_pane_dom(prev_pane)
+        if hasattr(svc, "set_agent_hwnd"):
+            svc.set_agent_hwnd(agent_hwnd(state))
+        if hasattr(svc, "set_embed_backend"):
+            svc.set_embed_backend(
+                "native_child" if state.get("native_child") else "visual"
+            )
+    else:
+        if hasattr(svc, "set_follow_mode"):
+            svc.set_follow_mode("sidecar")
+        if not state.get("embedded"):
+            if hasattr(svc, "set_last_pane_dom"):
+                svc.set_last_pane_dom(None)
+            if hasattr(svc, "set_agent_hwnd"):
+                svc.set_agent_hwnd(0)
+            if hasattr(svc, "set_embed_backend"):
+                svc.set_embed_backend("visual")
 
 
 def apply_preset_to_cfg(cfg: dict[str, Any], preset: str) -> None:
@@ -726,6 +788,9 @@ def cmd_attach(
             monitor=_monitor_arg(cfg),
         )
 
+        prev = read_state()
+        prev_agent = prev.get("cursor_agent") if isinstance(prev.get("cursor_agent"), dict) else None
+
         new_state = {
             "attached": True,
             "timestamp": time.time(),
@@ -733,6 +798,8 @@ def cmd_attach(
             "preset": cfg.get("preset", "normal"),
             "obsidian": obs_snap,
             "cursor": cur_snap,
+            "cursor_editor": cur_snap,
+            "cursor_agent": prev_agent,
             "left_rect": list(left.as_tuple()),
             "right_rect": list(right.as_tuple()),
             "bound": {
@@ -760,6 +827,20 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
         stop_live_follow()
         truth = refresh_attachment_truth()
         state = truth["state"]
+        migrate_cursor_roles(state)
+        # Exit Agents Pane chrome first (agent HWND only — not editor)
+        if state.get("embedded") or state.get("native_child"):
+            if state.get("native_child"):
+                _force_exit_native_child(state)
+            else:
+                ah = agent_hwnd(state)
+                if ah:
+                    restore_window_chrome(ah, state.get("embedded_snapshot"))
+            state["embedded"] = False
+            state["embed_mode"] = "sidecar"
+            state["embedded_snapshot"] = None
+            state["last_pane_dom"] = None
+            state["native_child"] = False
         preset = state.get("preset") or cfg.get("preset", "normal")
         if not state.get("obsidian") and not state.get("cursor"):
             print("[sidecar] no saved state; already detached")
@@ -769,6 +850,8 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
                     "timestamp": time.time(),
                     "version": VERSION,
                     "preset": preset,
+                    "embed_mode": "sidecar",
+                    "embedded": False,
                 }
             )
             return 0
@@ -782,7 +865,8 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
             clear_pid(PID_FILE)
 
         obs_snap = state.get("obsidian") or {}
-        cur_snap = state.get("cursor") or {}
+        cur_snap = get_editor_binding(state) or state.get("cursor") or {}
+        agent_snap = get_agent_binding(state)
 
         def _restore(snap: dict[str, Any]) -> str:
             check = validate_window_binding(snap if snap else None)
@@ -797,6 +881,7 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
 
         r_obs = _restore(obs_snap)
         r_cur = _restore(cur_snap)
+        r_agent = _restore(agent_snap) if agent_snap else "skip"
 
         write_state(
             {
@@ -804,15 +889,20 @@ def cmd_detach(cfg: dict[str, Any], **_: Any) -> int:
                 "timestamp": time.time(),
                 "version": VERSION,
                 "preset": preset,
+                "embed_mode": "sidecar",
+                "embedded": False,
                 "last_detach": {
                     "obsidian": r_obs,
                     "cursor": r_cur,
+                    "agent": r_agent,
                 },
                 "obsidian": obs_snap,
                 "cursor": cur_snap,
+                "cursor_editor": cur_snap,
+                "cursor_agent": agent_snap,
             }
         )
-        print(f"[sidecar] detached (obsidian={r_obs}, cursor={r_cur})")
+        print(f"[sidecar] detached (obsidian={r_obs}, cursor={r_cur}, agent={r_agent})")
         return 0
 
 
@@ -1352,6 +1442,16 @@ def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
             "last_sync_at": _CONTEXT_FOLLOW_GATE.last_sync_at or None,
         },
         "context_sync": _get_context_sync().status(),
+        "embedded": build_embedded_status(state),
+        "cursor_editor": {
+            "ok": bool(editor_binding_ok(state).get("ok")),
+            "hwnd": editor_hwnd(state) or None,
+        },
+        "cursor_agent": {
+            "ok": bool(agent_binding_ok(state).get("ok")),
+            "hwnd": agent_hwnd(state) or None,
+            "bound": bool(get_agent_binding(state)),
+        },
         "obsidian_binding": {
             "ok": obs_live,
             "legacy_binding": bool(obs_rep.get("legacy_binding")),
@@ -1393,6 +1493,636 @@ def cmd_status(cfg: dict[str, Any], as_json: bool = False, **_: Any) -> int:
     print(f"  follow_pid: {payload['follow_pid'] or 'none'}")
     print(f"  daemon_pid: {payload['daemon_pid'] or 'none'}")
     return 0
+
+
+# ---- Agents Pane (visual embed of Agents Window; editor untouched) --------
+
+
+def _obsidian_hwnd(state: dict[str, Any]) -> int:
+    try:
+        return int((state.get("obsidian") or {}).get("hwnd") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_embedded_status(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    st = state if state is not None else read_state()
+    migrate_cursor_roles(st)
+    ag = get_agent_binding(st)
+    oh = _obsidian_hwnd(st)
+    ah = agent_hwnd(st)
+    claimed_backend = st.get("embed_backend") or "visual"
+    claimed_native = bool(st.get("native_child"))
+
+    live: dict[str, Any] = {}
+    verified = False
+    if ah and oh:
+        try:
+            live = probe_hwnd_win32(ah, expected_parent=oh)
+            verified = bool(live.get("is_native_child_verified"))
+        except Exception as exc:
+            live = {"ok": False, "error": str(exc)}
+
+    # Hard rule: native_child=true ONLY when Win32 verifies
+    out: dict[str, Any] = {
+        "mode": st.get("embed_mode") or "sidecar",
+        "embedded": bool(st.get("embedded")),
+        "embed_backend": claimed_backend,
+        "backend": claimed_backend,
+        "native_child": bool(verified),  # live only
+        "native_child_claimed": claimed_native,
+        "is_native_child": bool(verified),
+        "target": "agent",
+        "agent_bound": bool(ag),
+        "obsidian_hwnd": oh or None,
+        "agent_hwnd": ah or None,
+        "editor_hwnd": editor_hwnd(st) or None,
+        "agent_parent_hwnd": live.get("parent_hwnd"),
+        "expected_parent_hwnd": oh or None,
+        "WS_CHILD": live.get("WS_CHILD"),
+        "WS_POPUP": live.get("WS_POPUP"),
+        "WS_CAPTION": live.get("WS_CAPTION"),
+        "WS_THICKFRAME": live.get("WS_THICKFRAME"),
+        "agent_style": live.get("style"),
+        "style_after": live.get("style"),
+        "obsidian_dpi": None,
+        "agent_dpi": live.get("dpi"),
+        "visible": None,
+        "dom_rect": st.get("last_pane_dom"),
+        "screen_rect": None,
+        "client_rect": None,
+        "scale_x": None,
+        "scale_y": None,
+        "agent_stale_reason": st.get("agent_stale_reason"),
+        "win32": live,
+    }
+    try:
+        if oh:
+            from native_embed import read_dpi
+
+            out["obsidian_dpi"] = read_dpi(oh)
+    except Exception:
+        pass
+    if _FOLLOW is not None and isinstance(_FOLLOW.last_embed_apply, dict):
+        mapped = _FOLLOW.last_embed_apply
+        out["visible"] = mapped.get("visible")
+        out["screen_rect"] = mapped.get("screen_rect")
+        out["client_rect"] = mapped.get("client_rect")
+        out["scale_x"] = mapped.get("scale_x")
+        out["scale_y"] = mapped.get("scale_y")
+        if mapped.get("dom_rect"):
+            out["dom_rect"] = mapped.get("dom_rect")
+    return out
+
+
+def begin_bind_agents_window(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot current Cursor HWNDs before user opens New Agents Window."""
+    proc = str(cfg.get("cursor_process") or "Cursor.exe")
+    with LIFECYCLE_LOCK:
+        state = read_state()
+        before = list_cursor_top_level(proc)
+        state["agent_bind_before"] = before
+        state["timestamp"] = time.time()
+        write_state(state)
+        return {
+            "ok": True,
+            "cmd": "begin-bind-agents-window",
+            "before_count": len(before),
+            "hint": "Open Cursor → File → New Agents Window, then run complete-bind-agents-window",
+        }
+
+
+def complete_bind_agents_window(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Diff HWND set; bind exactly one new Cursor top-level as agent."""
+    proc = str(cfg.get("cursor_process") or "Cursor.exe")
+    with LIFECYCLE_LOCK:
+        state = read_state()
+        migrate_cursor_roles(state)
+        before = state.get("agent_bind_before")
+        if not isinstance(before, list):
+            return {
+                "ok": False,
+                "error": "bind_not_started",
+                "hint": "Run begin-bind-agents-window first",
+            }
+        after = list_cursor_top_level(proc)
+        # Exclude editor HWND from "new" candidates if it somehow appears
+        eh = editor_hwnd(state)
+        newcomers = [
+            w for w in diff_new_hwnds(before, after) if int(w.get("hwnd") or 0) != eh
+        ]
+        if len(newcomers) == 0:
+            return {"ok": False, "error": "agent_window_not_found", "after_count": len(after)}
+        if len(newcomers) > 1:
+            return {
+                "ok": False,
+                "error": "agent_window_ambiguous",
+                "candidates": newcomers,
+            }
+        hwnd = int(newcomers[0]["hwnd"])
+        snap = bind_agent_from_hwnd(hwnd, process_name=proc)
+        if not snap:
+            return {"ok": False, "error": "agent_snapshot_failed"}
+        state["cursor_agent"] = snap
+        state["agent_bind_before"] = None
+        state["agent_stale_reason"] = None
+        state["timestamp"] = time.time()
+        write_state(state)
+        return {
+            "ok": True,
+            "cmd": "complete-bind-agents-window",
+            "agent": {"hwnd": snap["hwnd"], "pid": snap["pid"], "title": snap.get("title")},
+            "embedded_status": build_embedded_status(state),
+        }
+
+
+def select_agents_window(cfg: dict[str, Any], *, confirm: bool = False, hwnd: int | None = None) -> dict[str, Any]:
+    """Bind an already-open Agents window (excludes editor). No silent auto-bind."""
+    proc = str(cfg.get("cursor_process") or "Cursor.exe")
+    with LIFECYCLE_LOCK:
+        state = read_state()
+        migrate_cursor_roles(state)
+        eh = editor_hwnd(state)
+        windows = list_cursor_top_level(proc)
+        cands = candidates_excluding_editor(windows, eh)
+        if hwnd is not None:
+            hwnd_i = int(hwnd)
+            match = [w for w in cands if int(w.get("hwnd") or 0) == hwnd_i]
+            if not match:
+                return {"ok": False, "error": "hwnd_not_candidate", "candidates": cands}
+            if not confirm:
+                return {
+                    "ok": False,
+                    "error": "confirm_required",
+                    "candidate": match[0],
+                    "hint": "Pass confirm=true to bind this HWND",
+                }
+            snap = bind_agent_from_hwnd(hwnd_i, process_name=proc)
+            if not snap:
+                return {"ok": False, "error": "agent_snapshot_failed"}
+            state["cursor_agent"] = snap
+            state["agent_stale_reason"] = None
+            write_state(state)
+            return {
+                "ok": True,
+                "cmd": "select-agents-window",
+                "agent": {"hwnd": snap["hwnd"], "pid": snap["pid"], "title": snap.get("title")},
+            }
+        if len(cands) == 0:
+            return {"ok": False, "error": "agent_window_not_found", "candidates": []}
+        if len(cands) > 1:
+            return {"ok": False, "error": "agent_window_ambiguous", "candidates": cands}
+        if not confirm:
+            return {
+                "ok": False,
+                "error": "confirm_required",
+                "candidate": cands[0],
+                "hint": "Pass confirm=true to bind the sole non-editor Cursor window",
+            }
+        snap = bind_agent_from_hwnd(int(cands[0]["hwnd"]), process_name=proc)
+        if not snap:
+            return {"ok": False, "error": "agent_snapshot_failed"}
+        state["cursor_agent"] = snap
+        state["agent_stale_reason"] = None
+        write_state(state)
+        return {
+            "ok": True,
+            "cmd": "select-agents-window",
+            "agent": {"hwnd": snap["hwnd"], "pid": snap["pid"], "title": snap.get("title")},
+        }
+
+
+def enter_embedded_pane(cfg: dict[str, Any], pane: dict[str, Any]) -> dict[str, Any]:
+    """Enter Agents Pane mode. Moves agent_hwnd only. Requires Attach + agent bind."""
+    with LIFECYCLE_LOCK:
+        truth = refresh_attachment_truth()
+        if not truth["attached"]:
+            return {"ok": False, "error": "sidecar_not_attached"}
+        state = truth["state"]
+        migrate_cursor_roles(state)
+        obs_hwnd = _obsidian_hwnd(state)
+        if not obs_hwnd or not validate_window_binding(state.get("obsidian")).get("ok"):
+            return {"ok": False, "error": "stale_binding", "which": "obsidian"}
+        # Editor must remain valid for Context Follow — but we do NOT move it
+        ed_ok = editor_binding_ok(state)
+        if not ed_ok.get("ok"):
+            return {"ok": False, "error": "stale_binding", "which": "editor"}
+
+        ag_ok = agent_binding_ok(state)
+        backend = str(
+            (pane.get("backend") if isinstance(pane, dict) else None)
+            or state.get("embed_backend")
+            or cfg.get("embed_backend")
+            or "visual"
+        ).strip().lower()
+        use_native = backend in ("native_child", "native")
+
+        auto_bind: dict[str, Any] | None = None
+        if not ag_ok.get("ok"):
+            if use_native:
+                auto_bind = ensure_agents_window_bound(cfg, state)
+                if not auto_bind.get("ok"):
+                    write_state(state)
+                    return {
+                        "ok": False,
+                        "error": auto_bind.get("error") or "agent_window_not_found",
+                        "auto_bind": auto_bind,
+                        "visual_fallback": False,
+                        "hint": "Could not open/bind Agents Window automatically",
+                        "embedded_status": build_embedded_status(state),
+                    }
+                write_state(state)
+            else:
+                return {
+                    "ok": False,
+                    "error": "agent_not_bound",
+                    "reason": ag_ok.get("reason"),
+                    "hint": "Open Cursor → File → New Agents Window, then Bind Agents Window",
+                }
+        ah = agent_hwnd(state)
+        if not ah:
+            return {
+                "ok": False,
+                "error": "agent_window_not_found" if use_native else "agent_not_bound",
+                "visual_fallback": False,
+            }
+
+        dom = DomPaneRect.from_dict(pane)
+        if dom is None:
+            return {"ok": False, "error": "invalid_pane"}
+        pane_dict = dom.to_dict()
+        if isinstance(pane, dict):
+            for k in ("backend", "chrome_level", "borderless"):
+                if k in pane:
+                    pane_dict[k] = pane[k]
+
+        if use_native:
+            result = _enter_native_agents_embed(cfg, state, obs_hwnd, ah, pane_dict)
+            if auto_bind:
+                result = dict(result)
+                result["auto_bind"] = auto_bind
+            return result
+
+        if state.get("native_child"):
+            _force_exit_native_child(state)
+
+        if not state.get("embedded"):
+            # Embedded temporary layer on AGENT only — never touch editor chrome
+            state["embedded_snapshot"] = snapshot_window_chrome(ah)
+            state["agent_runtime_rect"] = list(get_window_rect(ah).as_tuple())
+
+        borderless = bool(cfg.get("embed_borderless")) or bool(pane.get("borderless"))
+        if borderless:
+            apply_borderless(ah)
+
+        # Owned-window only for visual backend (never mix with SetParent)
+        if bool(cfg.get("experimental_owned_window")):
+            set_owner_experimental(ah, obs_hwnd)
+
+        state["embed_mode"] = "pane"
+        state["embedded"] = True
+        state["embed_backend"] = "visual"
+        state["native_child"] = False
+        state["embed_target"] = "agent"
+        state["last_pane_dom"] = pane_dict
+        state["timestamp"] = time.time()
+        write_state(state)
+
+        if _FOLLOW:
+            _FOLLOW.set_follow_mode("pane")
+            _FOLLOW.set_last_pane_dom(pane_dict)
+            _FOLLOW.set_agent_hwnd(ah)
+            if hasattr(_FOLLOW, "set_embed_backend"):
+                _FOLLOW.set_embed_backend("visual")
+
+        mapped = apply_embedded_pane(
+            obsidian_hwnd=obs_hwnd,
+            cursor_hwnd=ah,
+            pane=pane_dict,
+        )
+        if _FOLLOW:
+            _FOLLOW.last_embed_apply = mapped
+        return {
+            "ok": bool(mapped.get("ok")),
+            "cmd": "enter-embedded-pane",
+            "embedded": True,
+            "embed_mode": "pane",
+            "embed_backend": "visual",
+            "embed_target": "agent",
+            "agent_hwnd": ah,
+            "editor_hwnd": editor_hwnd(state),
+            "placement": mapped,
+            "embedded_status": build_embedded_status(state),
+            "error": mapped.get("error"),
+        }
+
+
+def open_native_agents_pane(cfg: dict[str, Any], pane: dict[str, Any]) -> dict[str, Any]:
+    """One-shot UX: auto-bind Agents Window + enter native_child. No visual fallback."""
+    pane = dict(pane or {})
+    pane["backend"] = "native_child"
+    result = enter_embedded_pane(cfg, pane)
+    out = dict(result) if isinstance(result, dict) else {"ok": False, "error": "enter_failed"}
+    out["cmd"] = "open-native-agents-pane"
+    out["visual_fallback"] = False
+    return out
+
+
+def _force_exit_native_child(state: dict[str, Any]) -> dict[str, Any]:
+    ah = agent_hwnd(state)
+    snap = state.get("native_restore_snapshot")
+    result: dict[str, Any] = {"ok": True, "noop": not state.get("native_child")}
+    if ah and state.get("native_child"):
+        result = exit_native_child(agent_hwnd=ah, snapshot=snap if isinstance(snap, dict) else None)
+    state["native_child"] = False
+    state["native_restore_snapshot"] = None
+    state["native_parent_hwnd"] = None
+    state["native_dpi"] = None
+    return result
+
+
+def _enter_native_agents_embed(
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    obs_hwnd: int,
+    ah: int,
+    pane_dict: dict[str, Any],
+) -> dict[str, Any]:
+    del cfg
+
+    def _persist(snap: dict[str, Any]) -> None:
+        # Persist recovery snapshot BEFORE SetParent; do NOT claim success yet
+        state["native_restore_snapshot"] = snap
+        state["native_child_pending"] = True
+        state["embed_backend"] = "native_child"
+        state["last_pane_dom"] = pane_dict
+        state["timestamp"] = time.time()
+        write_state(state)
+
+    result = enter_native_child(
+        agent_hwnd=ah,
+        obsidian_hwnd=obs_hwnd,
+        pane=pane_dict,
+        persist_snapshot=_persist,
+    )
+    if not result.get("ok") or not result.get("is_native_child_verified"):
+        # Clear pending claim; keep snapshot for recover if half-applied
+        state["native_child"] = False
+        state["native_child_pending"] = False
+        state["embedded"] = False
+        state["embed_mode"] = "sidecar"
+        write_state(state)
+        return {
+            "ok": False,
+            "cmd": "enter-native-agents-embed",
+            "error": result.get("error") or "native_child_enter_failed",
+            "win32_error": result.get("win32_error"),
+            "placement": result,
+            "embedded_status": build_embedded_status(state),
+            # Explicit: never fall back to visual
+            "visual_fallback": False,
+        }
+
+    state["native_child"] = True
+    state["native_child_pending"] = False
+    state["embed_backend"] = "native_child"
+    state["embed_mode"] = "pane"
+    state["embedded"] = True
+    state["embed_target"] = "agent"
+    state["native_parent_hwnd"] = result.get("parent_hwnd")
+    state["native_dpi"] = result.get("dpi")
+    state["last_pane_dom"] = pane_dict
+    state["timestamp"] = time.time()
+    write_state(state)
+
+    if _FOLLOW:
+        _FOLLOW.set_follow_mode("pane")
+        _FOLLOW.set_last_pane_dom(pane_dict)
+        _FOLLOW.set_agent_hwnd(ah)
+        if hasattr(_FOLLOW, "set_embed_backend"):
+            _FOLLOW.set_embed_backend("native_child")
+        _FOLLOW.last_embed_apply = result
+
+    return {
+        "ok": True,
+        "cmd": "enter-native-agents-embed",
+        "embedded": True,
+        "embed_mode": "pane",
+        "embed_backend": "native_child",
+        "is_native_child_verified": True,
+        "embed_target": "agent",
+        "agent_hwnd": ah,
+        "obsidian_hwnd": obs_hwnd,
+        "agent_parent_hwnd": result.get("parent_hwnd"),
+        "style": result.get("style"),
+        "style_after": result.get("style_after") or result.get("style"),
+        "WS_CHILD": True,
+        "WS_POPUP": False,
+        "WS_CAPTION": result.get("WS_CAPTION"),
+        "WS_THICKFRAME": result.get("WS_THICKFRAME"),
+        "chrome": result.get("chrome"),
+        "win32_error": result.get("win32_error"),
+        "editor_hwnd": editor_hwnd(state),
+        "placement": result,
+        "embedded_status": build_embedded_status(state),
+    }
+
+
+def update_embedded_pane(cfg: dict[str, Any], pane: dict[str, Any]) -> dict[str, Any]:
+    """Update cached DOM pane rect; reposition agent_hwnd only."""
+    del cfg
+    with LIFECYCLE_LOCK:
+        truth = refresh_attachment_truth()
+        state = truth["state"]
+        migrate_cursor_roles(state)
+        if not state.get("embedded") or str(state.get("embed_mode") or "") != "pane":
+            return {
+                "ok": True,
+                "cmd": "update-embedded-pane",
+                "ignored": True,
+                "reason": "embed_mode_off",
+            }
+        if not truth["attached"]:
+            return {"ok": False, "error": "sidecar_not_attached"}
+        obs_hwnd = _obsidian_hwnd(state)
+        if not obs_hwnd or not validate_window_binding(state.get("obsidian")).get("ok"):
+            return {"ok": False, "error": "stale_binding", "which": "obsidian"}
+
+        ag_ok = agent_binding_ok(state)
+        if not ag_ok.get("ok"):
+            # Agent closed — leave embed, do NOT bind editor
+            if state.get("native_child"):
+                _force_exit_native_child(state)
+            clear_agent_binding(state, reason=str(ag_ok.get("reason") or "stale_agent"))
+            state["embedded"] = False
+            state["embed_mode"] = "sidecar"
+            state["embedded_snapshot"] = None
+            state["last_pane_dom"] = None
+            write_state(state)
+            if _FOLLOW:
+                _FOLLOW.set_follow_mode("sidecar")
+                _FOLLOW.set_agent_hwnd(0)
+                _FOLLOW.set_last_pane_dom(None)
+            return {
+                "ok": False,
+                "error": "agent_window_closed",
+                "reason": ag_ok.get("reason"),
+                "embedded": False,
+            }
+
+        ah = agent_hwnd(state)
+        dom = DomPaneRect.from_dict(pane)
+        if dom is None:
+            return {"ok": False, "error": "invalid_pane"}
+        pane_dict = dom.to_dict()
+        state["last_pane_dom"] = pane_dict
+        state["timestamp"] = time.time()
+        write_state(state)
+
+        backend = "native_child" if state.get("native_child") else "visual"
+        if _FOLLOW:
+            _FOLLOW.set_follow_mode("pane")
+            _FOLLOW.set_last_pane_dom(pane_dict)
+            _FOLLOW.set_agent_hwnd(ah)
+            if hasattr(_FOLLOW, "set_embed_backend"):
+                _FOLLOW.set_embed_backend(backend)
+
+        if backend == "native_child":
+            mapped = update_native_child(
+                agent_hwnd=ah, obsidian_hwnd=obs_hwnd, pane=pane_dict
+            )
+        else:
+            mapped = apply_embedded_pane(
+                obsidian_hwnd=obs_hwnd,
+                cursor_hwnd=ah,
+                pane=pane_dict,
+            )
+        if _FOLLOW:
+            _FOLLOW.last_embed_apply = mapped
+        return {
+            "ok": bool(mapped.get("ok")),
+            "cmd": "update-embedded-pane",
+            "ignored": False,
+            "embed_backend": backend,
+            "embed_target": "agent",
+            "placement": mapped,
+            "embedded_status": build_embedded_status(state),
+            "error": mapped.get("error"),
+        }
+
+
+def exit_embedded_pane(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Leave Agents Pane → restore agent (visual chrome or native SetParent reverse)."""
+    del cfg
+    with LIFECYCLE_LOCK:
+        truth = refresh_attachment_truth()
+        state = truth["state"]
+        migrate_cursor_roles(state)
+        if not state.get("embedded") and not state.get("native_child"):
+            return {
+                "ok": True,
+                "cmd": "exit-embedded-pane",
+                "embedded": False,
+                "embed_mode": "sidecar",
+                "noop": True,
+            }
+        native_result = None
+        if state.get("native_child"):
+            native_result = _force_exit_native_child(state)
+        else:
+            ah = agent_hwnd(state)
+            if ah:
+                restore_window_chrome(ah, state.get("embedded_snapshot"))
+
+        state["embedded"] = False
+        state["embed_mode"] = "sidecar"
+        state["embed_target"] = None
+        state["embedded_snapshot"] = None
+        state["last_pane_dom"] = None
+        state["native_child"] = False
+        state["timestamp"] = time.time()
+        write_state(state)
+
+        if _FOLLOW:
+            _FOLLOW.set_follow_mode("sidecar")
+            _FOLLOW.set_last_pane_dom(None)
+            _FOLLOW.set_agent_hwnd(0)
+            _FOLLOW.last_embed_apply = None
+            if hasattr(_FOLLOW, "set_embed_backend"):
+                _FOLLOW.set_embed_backend("visual")
+
+        return {
+            "ok": True,
+            "cmd": "exit-embedded-pane",
+            "embedded": False,
+            "embed_mode": "sidecar",
+            "arranged": False,
+            "attached": truth["attached"],
+            "editor_untouched": True,
+            "native_restore": native_result,
+            "embedded_status": build_embedded_status(state),
+        }
+
+
+def recover_native_agents_window(cfg: dict[str, Any]) -> dict[str, Any]:
+    del cfg
+    with LIFECYCLE_LOCK:
+        state = read_state()
+        snap = state.get("native_restore_snapshot")
+        result = recover_native_child(snap if isinstance(snap, dict) else None)
+        state["native_child"] = False
+        state["embedded"] = False
+        state["embed_mode"] = "sidecar"
+        state["native_restore_snapshot"] = None
+        state["native_parent_hwnd"] = None
+        state["timestamp"] = time.time()
+        write_state(state)
+        if _FOLLOW:
+            _FOLLOW.set_follow_mode("sidecar")
+            _FOLLOW.set_agent_hwnd(0)
+            if hasattr(_FOLLOW, "set_embed_backend"):
+                _FOLLOW.set_embed_backend("visual")
+        return {
+            "ok": bool(result.get("ok")),
+            "cmd": "recover-native-child",
+            "result": result,
+            "embedded_status": build_embedded_status(state),
+        }
+
+
+def set_embed_backend(cfg: dict[str, Any], backend: str) -> dict[str, Any]:
+    b = "native_child" if str(backend).strip().lower() in ("native_child", "native") else "visual"
+    with LIFECYCLE_LOCK:
+        cfg["embed_backend"] = b
+        try:
+            update_config_file({"embed_backend": b})
+        except OSError:
+            pass
+        state = read_state()
+        if state.get("native_child") and b == "visual":
+            return {"ok": False, "error": "exit_native_first"}
+        if state.get("embedded") and not state.get("native_child") and b == "native_child":
+            return {"ok": False, "error": "exit_visual_first"}
+        state["embed_backend"] = b
+        write_state(state)
+        return {"ok": True, "cmd": "set-embed-backend", "embed_backend": b}
+
+
+def focus_agents_window(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Focus bound Agents Window only (never editor)."""
+    del cfg
+    with LIFECYCLE_LOCK:
+        state = read_state()
+        migrate_cursor_roles(state)
+        ag_ok = agent_binding_ok(state)
+        if not ag_ok.get("ok"):
+            return {"ok": False, "error": "agent_not_bound", "reason": ag_ok.get("reason")}
+        ah = agent_hwnd(state)
+        try:
+            focus_window(ah)
+            return {"ok": True, "cmd": "focus-agents-window", "agent_hwnd": ah}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
 
 def cmd_stop(cfg: dict[str, Any], **_: Any) -> int:
@@ -1503,6 +2233,64 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
                 daemon=True,
             ).start()
             return {"ok": True, "cmd": cmd, "shutting_down": True}
+        elif cmd in ("focus-agents-window", "focus_agents_window"):
+            return focus_agents_window(cfg)
+        elif cmd in ("begin-bind-agents-window", "begin_bind_agents_window"):
+            return begin_bind_agents_window(cfg)
+        elif cmd in ("complete-bind-agents-window", "complete_bind_agents_window"):
+            return complete_bind_agents_window(cfg)
+        elif cmd in ("select-agents-window", "select_agents_window", "bind-agents-window"):
+            # bind-agents-window alias: if no before snapshot, treat as select with confirm
+            if "confirm" in body or body.get("hwnd") is not None:
+                return select_agents_window(
+                    cfg,
+                    confirm=bool(body.get("confirm")),
+                    hwnd=int(body["hwnd"]) if body.get("hwnd") is not None else None,
+                )
+            # two-step: begin if no snapshot, else complete
+            st = read_state()
+            if isinstance(st.get("agent_bind_before"), list):
+                return complete_bind_agents_window(cfg)
+            return begin_bind_agents_window(cfg)
+        elif cmd in (
+            "enter-embedded-pane",
+            "enter_embedded_pane",
+            "enter-agents-pane",
+            "enter-native-agents-embed",
+            "open-native-agents-pane",
+            "open_native_agents_pane",
+        ):
+            pane = body.get("pane")
+            if not isinstance(pane, dict):
+                return {"ok": False, "error": "pane required"}
+            if cmd in (
+                "enter-native-agents-embed",
+                "open-native-agents-pane",
+                "open_native_agents_pane",
+            ) or body.get("backend") == "native_child":
+                pane = dict(pane)
+                pane["backend"] = "native_child"
+            if cmd in ("open-native-agents-pane", "open_native_agents_pane"):
+                return open_native_agents_pane(cfg, pane)
+            return enter_embedded_pane(cfg, pane)
+        elif cmd in ("update-embedded-pane", "update_embedded_pane", "update-native-child-pane"):
+            pane = body.get("pane")
+            if not isinstance(pane, dict):
+                return {"ok": False, "error": "pane required"}
+            return update_embedded_pane(cfg, pane)
+        elif cmd in (
+            "exit-embedded-pane",
+            "exit_embedded_pane",
+            "exit-agents-pane",
+            "exit-native-agents-embed",
+        ):
+            return exit_embedded_pane(cfg)
+        elif cmd in ("recover-native-child", "recover_native_child", "recover-native-agents-window"):
+            return recover_native_agents_window(cfg)
+        elif cmd in ("set-embed-backend", "set_embed_backend"):
+            if "backend" not in body and "embed_backend" not in body:
+                return {"ok": False, "error": "backend required"}
+            return set_embed_backend(cfg, str(body.get("backend") or body.get("embed_backend")))
         elif cmd == "status":
             return {"ok": True, "cmd": cmd, "status": build_status(cfg)}
         else:
@@ -1516,6 +2304,7 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
             "state_valid": truth["state_valid"],
             "preset": cfg.get("preset"),
             "live_follow": _FOLLOW.status() if _FOLLOW else None,
+            "embedded": build_embedded_status(),
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "cmd": cmd, "error": str(exc)}
@@ -1532,6 +2321,15 @@ def run_daemon(cfg: dict[str, Any]) -> int:
     host, port = cfg["daemon_host"], cfg["daemon_port"]
     expected_token = ensure_daemon_token()
     print(f"[sidecar] daemon http://{host}:{port} (token auth; live_follow={cfg.get('live_follow')})")
+
+    # Crash recovery: agent left as Obsidian child
+    st0 = read_state()
+    if st0.get("native_child") and st0.get("native_restore_snapshot"):
+        print("[sidecar] recovering native_child leftover from previous session…")
+        try:
+            recover_native_agents_window(cfg)
+        except Exception as exc:
+            print(f"[sidecar] native recover failed: {exc}")
 
     ensure_live_follow_service(cfg)
     # Resume follow if already attached when daemon starts

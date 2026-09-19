@@ -1,10 +1,9 @@
-# Cursor Sidecar v0.6.0 — Context Follow
+# Cursor Sidecar v0.7.0-dev — Embedded Agents Pane
 
-Dock the **real Cursor Desktop** beside Obsidian on Windows, keep Cursor
-stuck to Obsidian’s right edge while attached, and optionally keep Cursor
-on the **active Obsidian file** without stealing focus.
+Sidecar Mode + Context Follow (Editor Window) preserved.
 
-Stable packaged baseline remains v0.5.0; this tree is **0.6.0-dev** until tagged.
+**New:** embed Cursor **New Agents Window** into an Obsidian ItemView (visual
+`SetWindowPos` only — no SetParent). Full Editor stays for file context.
 
 ## End-user install
 

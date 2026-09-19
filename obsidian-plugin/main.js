@@ -1,10 +1,11 @@
-const { Plugin, Notice, PluginSettingTab, Setting, addIcon, MarkdownView, TFile, FileSystemAdapter } = require("obsidian");
+const { Plugin, Notice, PluginSettingTab, Setting, addIcon, MarkdownView, TFile, ItemView, WorkspaceLeaf } = require("obsidian");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
 
 const ICON_ID = "cursor-sidecar";
+const VIEW_TYPE_EMBEDDED_PANE = "cursor-sidecar-pane";
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
   <path d="m18 16 4-4-4-4"/>
   <path d="m6 8-4 4 4 4"/>
@@ -22,10 +23,14 @@ const DEFAULT_SETTINGS = {
   contextFollow: false,
   openVaultInCursor: true,
   showNotices: true,
+  embeddedPaneExperimental: true,
+  borderlessCursorExperimental: false,
+  embedBackend: "native_child", // "visual" | "native_child" — v0.7.1 defaults native
 };
 
 const CONTEXT_FOLLOW_DEBOUNCE_MS = 150;
 const CONTEXT_FOLLOW_SUPPRESS_MS = 400;
+const PANE_RECT_THROTTLE_MS = 32;
 
 /** Rebase local seq against daemon latest_seq + clock (plugin reload safe). */
 function nextContextSyncSeq(localSeq, daemonSeq, nowMs) {
@@ -34,6 +39,207 @@ function nextContextSyncSeq(localSeq, daemonSeq, nowMs) {
   const ms = nowMs == null ? Date.now() : Number(nowMs) || 0;
   const clockBase = ms * 1000;
   return Math.max(local, daemon, clockBase) + 1;
+}
+
+class CursorSidecarPaneView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this._embeddedUi = false;
+    this._hostEl = null;
+    this._statusEl = null;
+    this._actionsEl = null;
+    this._ro = null;
+  }
+
+  getViewType() {
+    return VIEW_TYPE_EMBEDDED_PANE;
+  }
+
+  getDisplayText() {
+    return "Cursor Agents";
+  }
+
+  getIcon() {
+    return ICON_ID;
+  }
+
+  async onOpen() {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("cursor-sidecar-pane");
+    root.style.display = "flex";
+    root.style.flexDirection = "column";
+    root.style.alignItems = "stretch";
+    root.style.justifyContent = "center";
+    root.style.height = "100%";
+    root.style.padding = "12px";
+    root.style.boxSizing = "border-box";
+
+    this._hostEl = root.createDiv({ cls: "cursor-sidecar-pane-host" });
+    this._hostEl.style.flex = "1";
+    this._hostEl.style.minHeight = "0";
+    this._hostEl.style.display = "flex";
+    this._hostEl.style.flexDirection = "column";
+    this._hostEl.style.alignItems = "center";
+    this._hostEl.style.justifyContent = "center";
+    this._hostEl.style.gap = "10px";
+
+    this._statusEl = this._hostEl.createEl("div", {
+      cls: "cursor-sidecar-pane-status",
+      text: "Cursor Agents\nNo Agents Window bound",
+    });
+    this._statusEl.style.whiteSpace = "pre-line";
+    this._statusEl.style.textAlign = "center";
+    this._statusEl.style.opacity = "0.85";
+
+    this._actionsEl = this._hostEl.createDiv({ cls: "cursor-sidecar-pane-actions" });
+    this._actionsEl.style.display = "flex";
+    this._actionsEl.style.gap = "8px";
+    this._actionsEl.style.flexWrap = "wrap";
+    this._actionsEl.style.justifyContent = "center";
+
+    this.renderPaneUi("unbound");
+    this.plugin.registerEmbeddedPaneView(this);
+    this._installResizeObserver();
+    this.plugin.schedulePaneRectUpdate();
+    this.plugin.refreshAgentsPaneUi().catch(() => {});
+  }
+
+  /**
+   * @param {"unbound"|"ready"|"opening"|"embedded"|"anchor"|"failed"|"closed"|"disabled"} mode
+   * @param {string} [detail]
+   */
+  renderPaneUi(mode, detail) {
+    this._paneMode = mode || "unbound";
+    if (!this._statusEl || !this._actionsEl) return;
+    this._actionsEl.empty();
+    const root = this.contentEl;
+    const host = this._hostEl;
+    const setAnchorChrome = (on) => {
+      if (root) {
+        root.toggleClass("is-native-anchor", !!on);
+        root.style.padding = on ? "0" : "12px";
+        root.style.justifyContent = on ? "stretch" : "center";
+      }
+      if (host) {
+        host.style.opacity = on ? "0" : "1";
+        host.style.pointerEvents = on ? "none" : "";
+      }
+    };
+    setAnchorChrome(false);
+    if (!this.plugin.settings.embeddedPaneExperimental) {
+      this._statusEl.setText("Cursor Agents\nExperimental setting is OFF");
+      this._statusEl.style.display = "";
+      const go = this._actionsEl.createEl("button", { text: "Open Settings", cls: "mod-cta" });
+      go.onclick = () => {
+        this.plugin.app.setting.open();
+        this.plugin.app.setting.openTabById("cursor-sidecar");
+      };
+      return;
+    }
+    if (mode === "anchor") {
+      setAnchorChrome(true);
+      this._statusEl.setText("");
+      this._statusEl.style.display = "none";
+      return;
+    }
+    this._statusEl.style.display = "";
+    if (mode === "opening") {
+      this._statusEl.setText("Cursor Agents\nOpening…");
+      return;
+    }
+    if (mode === "failed") {
+      this._statusEl.setText(`Cursor Agents\nNative embed failed\n${detail || ""}`);
+      const retry = this._actionsEl.createEl("button", { text: "Retry Native", cls: "mod-cta" });
+      retry.onclick = async () => {
+        await this.plugin.openNativeAgentsPane();
+      };
+      const exitBtn = this._actionsEl.createEl("button", { text: "Close" });
+      exitBtn.onclick = async () => {
+        await this.plugin.exitEmbeddedMode({ closePane: true });
+      };
+      return;
+    }
+    if (mode === "embedded") {
+      this._statusEl.setText("Cursor Agents\nEmbedded (visual)");
+      const exitBtn = this._actionsEl.createEl("button", { text: "Exit" });
+      exitBtn.onclick = async () => {
+        await this.plugin.exitEmbeddedMode({ closePane: false });
+      };
+      return;
+    }
+    if (mode === "closed") {
+      this._statusEl.setText("Cursor Agents\nAgents Window closed");
+      const reopen = this._actionsEl.createEl("button", { text: "Open Native Pane", cls: "mod-cta" });
+      reopen.onclick = async () => {
+        await this.plugin.openNativeAgentsPane();
+      };
+      return;
+    }
+    this._statusEl.setText("Cursor Agents\nReady");
+    const open = this._actionsEl.createEl("button", { text: "Open Native Pane", cls: "mod-cta" });
+    open.onclick = async () => {
+      await this.plugin.openNativeAgentsPane();
+    };
+  }
+
+  _installResizeObserver() {
+    const target = this.contentEl;
+    if (!target || typeof ResizeObserver === "undefined") return;
+    this._ro = new ResizeObserver(() => {
+      this.plugin.schedulePaneRectUpdate();
+    });
+    this._ro.observe(target);
+  }
+
+  getPaneRectPayload() {
+    const el = this.contentEl;
+    if (!el) {
+      return {
+        left: 0,
+        top: 0,
+        width: 0,
+        height: 0,
+        viewport_width: window.innerWidth || 1,
+        viewport_height: window.innerHeight || 1,
+        device_pixel_ratio: window.devicePixelRatio || 1,
+        visible: false,
+      };
+    }
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    const displayHidden = style.display === "none" || style.visibility === "hidden";
+    const nearZero = rect.width < 8 || rect.height < 8;
+    const leafVisible = !!(this.leaf && this.leaf.view === this);
+    const visible = !displayHidden && !nearZero && leafVisible;
+    return {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      viewport_width: window.innerWidth || 1,
+      viewport_height: window.innerHeight || 1,
+      device_pixel_ratio: window.devicePixelRatio || 1,
+      visible,
+    };
+  }
+
+  async onClose() {
+    if (this._ro) {
+      try {
+        this._ro.disconnect();
+      } catch (_e) {
+        /* ignore */
+      }
+      this._ro = null;
+    }
+    this.plugin.unregisterEmbeddedPaneView(this);
+    // Closing the pane exits embed (not Detach)
+    if (this.plugin._embedActive) {
+      await this.plugin.exitEmbeddedMode({ closePane: false, fromViewClose: true });
+    }
+  }
 }
 
 class CursorSidecarPlugin extends Plugin {
@@ -45,6 +251,16 @@ class CursorSidecarPlugin extends Plugin {
       this.settings.liveSidecar = !!saved.useDaemon;
     }
     addIcon(ICON_ID, ICON_SVG);
+
+    this._embeddedPaneView = null;
+    this._embedActive = false;
+    this._nativeVerified = false;
+    this._paneRaf = null;
+    this._paneLastSentAt = 0;
+    this._paneThrottleTimer = null;
+    this._lastEmbedDiag = null;
+
+    this.registerView(VIEW_TYPE_EMBEDDED_PANE, (leaf) => new CursorSidecarPaneView(leaf, this));
 
     this.addRibbonIcon(ICON_ID, "Cursor Sidecar: Attach / Detach", async () => {
       await this.runAction("click");
@@ -111,6 +327,51 @@ class CursorSidecarPlugin extends Plugin {
       name: "Cursor Sidecar: Open current vault in Cursor",
       callback: async () => this.openVaultInCursor(),
     });
+    this.addCommand({
+      id: "cursor-sidecar-open-embedded-pane",
+      name: "Cursor Sidecar: Open Native Agents Pane",
+      callback: async () => this.openNativeAgentsPane(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-close-embedded-pane",
+      name: "Cursor Sidecar: Close Agents Pane",
+      callback: async () => this.closeEmbeddedPane(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-toggle-embedded-mode",
+      name: "Cursor Sidecar: Toggle Native Agents Pane",
+      callback: async () => this.toggleEmbeddedMode(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-bind-agents-window",
+      name: "Cursor Sidecar: Bind Agents Window (debug)",
+      callback: async () => this.bindAgentsWindowFlow(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-focus-agents-window",
+      name: "Cursor Sidecar: Focus Agents Window",
+      callback: async () => this.focusAgentsWindow(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-enter-native-agents-embed",
+      name: "Cursor Sidecar: Open Native Agents Pane",
+      callback: async () => this.openNativeAgentsPane(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-exit-native-agents-embed",
+      name: "Cursor Sidecar: Exit Native Agents Embed",
+      callback: async () => this.exitEmbeddedMode({ closePane: false }),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-recover-native-agents",
+      name: "Cursor Sidecar: Recover Native Agents Window",
+      callback: async () => this.recoverNativeAgents(),
+    });
+    this.addCommand({
+      id: "cursor-sidecar-temp-hide-agents-child",
+      name: "Cursor Sidecar: Temporarily Hide Agents Child",
+      callback: async () => this.tempHideAgentsChild(),
+    });
 
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
@@ -145,6 +406,17 @@ class CursorSidecarPlugin extends Plugin {
       })
     );
 
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.schedulePaneRectUpdate();
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("resize", () => {
+        this.schedulePaneRectUpdate();
+      })
+    );
+
     this.addSettingTab(new CursorSidecarSettingTab(this.app, this));
     // Fire-and-forget version mismatch notice (packaged only)
     this.checkHelperVersionMismatch().catch(() => {});
@@ -173,6 +445,14 @@ class CursorSidecarPlugin extends Plugin {
       this._cfTimer = null;
     }
     this._cfGen += 1;
+    if (this._paneRaf) {
+      cancelAnimationFrame(this._paneRaf);
+      this._paneRaf = null;
+    }
+    if (this._paneThrottleTimer) {
+      clearTimeout(this._paneThrottleTimer);
+      this._paneThrottleTimer = null;
+    }
   }
 
   async saveSettings() {
@@ -182,6 +462,485 @@ class CursorSidecarPlugin extends Plugin {
   notify(message, isError = false) {
     if (!this.settings.showNotices && !isError) return;
     new Notice(message, isError ? 8000 : 4000);
+  }
+
+  registerEmbeddedPaneView(view) {
+    this._embeddedPaneView = view;
+  }
+
+  unregisterEmbeddedPaneView(view) {
+    if (this._embeddedPaneView === view) {
+      this._embeddedPaneView = null;
+    }
+  }
+
+  schedulePaneRectUpdate() {
+    if (!this._embedActive && !(this._embeddedPaneView && this.settings.embeddedPaneExperimental)) {
+      return;
+    }
+    if (this._paneRaf) return;
+    this._paneRaf = requestAnimationFrame(() => {
+      this._paneRaf = null;
+      const now = Date.now();
+      const wait = PANE_RECT_THROTTLE_MS - (now - (this._paneLastSentAt || 0));
+      if (wait > 0) {
+        if (this._paneThrottleTimer) return;
+        this._paneThrottleTimer = setTimeout(() => {
+          this._paneThrottleTimer = null;
+          this.flushPaneRectUpdate();
+        }, wait);
+        return;
+      }
+      this.flushPaneRectUpdate();
+    });
+  }
+
+  async flushPaneRectUpdate() {
+    if (!this._embedActive) return;
+    const view = this._embeddedPaneView;
+    if (!view) return;
+    const pane = view.getPaneRectPayload();
+    this._paneLastSentAt = Date.now();
+    this._lastEmbedDiag = { dom: pane, at: this._paneLastSentAt };
+    try {
+      if (!(await this.daemonHealthy())) return;
+      const body = { cmd: "update-embedded-pane", pane };
+      if (this.settings.borderlessCursorExperimental) {
+        body.pane = Object.assign({}, pane, { borderless: true });
+      }
+      const result = await this.httpJson("POST", "/rpc", body);
+      if (result && result.error === "agent_window_closed") {
+        this._embedActive = false;
+        if (view && view.renderPaneUi) view.renderPaneUi("closed");
+        return;
+      }
+      if (result && result.placement) {
+        this._lastEmbedDiag.placement = result.placement;
+      }
+      if (view && typeof view.renderPaneUi === "function" && this._embedActive) {
+        view.renderPaneUi("embedded");
+      }
+    } catch (_e) {
+      /* ignore transient RPC errors during resize */
+    }
+  }
+
+  async ensureAttachedForEmbed() {
+    try {
+      const up = await this.ensureDaemon();
+      if (!up) return false;
+      const st = await this.httpJson("GET", "/status");
+      const status = (st && st.status) || st || {};
+      if (status.attached) return true;
+    } catch (_e) {
+      /* fall through */
+    }
+    return false;
+  }
+
+  async refreshAgentsPaneUi() {
+    const view = this._embeddedPaneView;
+    if (!view || typeof view.renderPaneUi !== "function") return;
+    if (this._embedActive) {
+      view.renderPaneUi(this._nativeVerified ? "anchor" : "embedded");
+      return;
+    }
+    try {
+      if (!(await this.daemonHealthy())) {
+        view.renderPaneUi("unbound");
+        return;
+      }
+      const st = await this.httpJson("GET", "/status");
+      const status = (st && st.status) || st || {};
+      const agent = status.cursor_agent || (status.embedded && status.embedded) || {};
+      const emb = status.embedded || {};
+      if (emb.agent_stale_reason || status.agent_stale_reason) {
+        view.renderPaneUi("closed");
+        return;
+      }
+      if (agent.bound || agent.ok || emb.agent_bound) {
+        view.renderPaneUi("ready");
+      } else {
+        view.renderPaneUi("unbound");
+      }
+    } catch (_e) {
+      view.renderPaneUi("unbound");
+    }
+  }
+
+  async bindAgentsWindowFlow() {
+    const up = await this.ensureDaemon();
+    if (!up) {
+      this.notify("Daemon unavailable — cannot bind Agents Window", true);
+      return;
+    }
+    try {
+      // Prefer select if a sole non-editor window already exists
+      let result = await this.httpJson("POST", "/rpc", {
+        cmd: "select-agents-window",
+        confirm: false,
+      });
+      if (result && result.error === "confirm_required" && result.candidate) {
+        const ok = window.confirm(
+          `Bind this Cursor window as Agents Window?\nHWND ${result.candidate.hwnd}\n${result.candidate.title || ""}`
+        );
+        if (!ok) return;
+        result = await this.httpJson("POST", "/rpc", {
+          cmd: "select-agents-window",
+          confirm: true,
+          hwnd: result.candidate.hwnd,
+        });
+        if (result && result.ok) {
+          this.notify("Agents Window bound");
+          await this.refreshAgentsPaneUi();
+          return;
+        }
+      }
+      if (result && result.ok) {
+        this.notify("Agents Window bound");
+        await this.refreshAgentsPaneUi();
+        return;
+      }
+
+      // Two-step: begin → user opens New Agents Window → complete
+      const begin = await this.httpJson("POST", "/rpc", { cmd: "begin-bind-agents-window" });
+      if (!begin || begin.ok === false) {
+        this.notify(`Bind failed: ${String((begin && begin.error) || "begin failed")}`, true);
+        return;
+      }
+      this.notify("Open Cursor → File → New Agents Window, then click OK");
+      window.alert(
+        "In Cursor Desktop:\nFile → New Agents Window\n\nWhen the Agents Window is open, click OK to bind it."
+      );
+      const done = await this.httpJson("POST", "/rpc", { cmd: "complete-bind-agents-window" });
+      if (!done || done.ok === false) {
+        const err = (done && done.error) || "complete failed";
+        this.notify(`Bind failed: ${String(err).slice(0, 200)}`, true);
+        await this.refreshAgentsPaneUi();
+        return;
+      }
+      this.notify("Agents Window bound");
+      await this.refreshAgentsPaneUi();
+    } catch (err) {
+      this.notify(`Bind error: ${err.message || err}`, true);
+    }
+  }
+
+  async focusAgentsWindow() {
+    try {
+      if (!(await this.daemonHealthy())) return;
+      const result = await this.httpJson("POST", "/rpc", { cmd: "focus-agents-window" });
+      if (!result || result.ok === false) {
+        this.notify(`Focus Agents failed: ${String((result && result.error) || "rpc")}`, true);
+        return;
+      }
+      this.notify("Focused Agents Window");
+    } catch (err) {
+      this.notify(`Focus Agents error: ${err.message || err}`, true);
+    }
+  }
+
+  async openEmbeddedPane() {
+    // Backward-compatible alias → native one-click flow
+    await this.openNativeAgentsPane();
+  }
+
+  async ensureAgentsPaneLeaf() {
+    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_EMBEDDED_PANE)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getRightLeaf(false);
+    }
+    if (!leaf) return null;
+    try {
+      if (this.app.workspace.rightSplit) {
+        this.app.workspace.rightSplit.expand();
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    await leaf.setViewState({ type: VIEW_TYPE_EMBEDDED_PANE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+    await sleep(50);
+    return leaf;
+  }
+
+  async openNativeAgentsPane() {
+    if (!this.settings.embeddedPaneExperimental) {
+      this.notify("Enable Embedded Agents Pane [Experimental] in settings first.", true);
+      return;
+    }
+    this.settings.embedBackend = "native_child";
+    await this.saveSettings();
+    const attached = await this.ensureAttachedForEmbed();
+    if (!attached) {
+      this.notify("Attach Cursor Sidecar first.", true);
+      return;
+    }
+    const leaf = await this.ensureAgentsPaneLeaf();
+    if (!leaf) {
+      this.notify("Could not open right sidebar leaf", true);
+      return;
+    }
+    const view = this._embeddedPaneView;
+    if (!view) {
+      this.notify("Agents Pane view missing", true);
+      return;
+    }
+    view.renderPaneUi("opening");
+    const up = await this.ensureDaemon();
+    if (!up) {
+      view.renderPaneUi("failed", "daemon unavailable");
+      this.notify("Cursor Sidecar: daemon unavailable", true);
+      return;
+    }
+    try {
+      await this.httpJson("POST", "/rpc", {
+        cmd: "set-embed-backend",
+        backend: "native_child",
+      });
+    } catch (_e) {
+      /* ignore */
+    }
+    await sleep(40);
+    const pane = view.getPaneRectPayload();
+    pane.backend = "native_child";
+    pane.chrome_level = "full";
+    if (this.settings.borderlessCursorExperimental) {
+      pane.borderless = true;
+    }
+    try {
+      const result = await this.httpJson("POST", "/rpc", {
+        cmd: "open-native-agents-pane",
+        pane,
+        backend: "native_child",
+      });
+      if (!result || result.ok === false) {
+        this._embedActive = false;
+        this._nativeVerified = false;
+        const detail = this._formatNativeFail(result);
+        view.renderPaneUi("failed", detail);
+        this.notify(`Native Agents Pane FAILED (no visual fallback): ${detail}`, true);
+        return;
+      }
+      const emb = result.embedded_status || {};
+      const verified =
+        !!result.is_native_child_verified ||
+        !!emb.native_child ||
+        !!emb.is_native_child;
+      if (!verified) {
+        this._embedActive = false;
+        this._nativeVerified = false;
+        const detail = this._formatNativeFail(result);
+        view.renderPaneUi("failed", detail);
+        this.notify(`Native NOT verified: ${detail}`, true);
+        return;
+      }
+      this._embedActive = true;
+      this._nativeVerified = true;
+      view.renderPaneUi("anchor");
+      this._lastEmbedDiag = {
+        dom: pane,
+        placement: result.placement,
+        parent: result.agent_parent_hwnd,
+        WS_CHILD: result.WS_CHILD,
+        WS_POPUP: result.WS_POPUP,
+        style_after: result.style_after || emb.style_after,
+        verified: true,
+        auto_bind: result.auto_bind,
+      };
+      this.notify(
+        `Native Agents Pane OK hwnd=${result.agent_hwnd} parent=${result.agent_parent_hwnd}`
+      );
+      this.schedulePaneRectUpdate();
+    } catch (err) {
+      this._embedActive = false;
+      this._nativeVerified = false;
+      view.renderPaneUi("failed", String(err.message || err));
+      this.notify(`Native Agents Pane error: ${err.message || err}`, true);
+    }
+  }
+
+  async closeEmbeddedPane() {
+    await this.exitEmbeddedMode({ closePane: true });
+  }
+
+  async toggleEmbeddedMode() {
+    if (this._embedActive) {
+      await this.exitEmbeddedMode({ closePane: false });
+      return;
+    }
+    await this.openNativeAgentsPane();
+  }
+
+  _formatNativeFail(result) {
+    const emb = (result && result.embedded_status) || {};
+    const place = (result && result.placement) || {};
+    const after = place.after || {};
+    const parent = emb.agent_parent_hwnd ?? after.parent_hwnd ?? place.parent_hwnd;
+    const expected = emb.expected_parent_hwnd ?? place.expected_parent_hwnd;
+    const bits = [
+      `err=${(result && result.error) || "native_child_enter_failed"}`,
+      `win32=${result && result.win32_error != null ? result.win32_error : "?"}`,
+      `GetParent=${parent ?? "?"}`,
+      `expected=${expected ?? "?"}`,
+      `WS_CHILD=${emb.WS_CHILD ?? after.WS_CHILD ?? place.WS_CHILD}`,
+      `WS_POPUP=${emb.WS_POPUP ?? after.WS_POPUP ?? place.WS_POPUP}`,
+      `verified=false`,
+    ];
+    return bits.join(" ");
+  }
+
+  async enterEmbeddedFromPane(view) {
+    if (!this.settings.embeddedPaneExperimental) {
+      this.notify("Enable Embedded Agents Pane [Experimental] in settings first.", true);
+      return;
+    }
+    const attached = await this.ensureAttachedForEmbed();
+    if (!attached) {
+      this.notify("Attach Cursor Sidecar first.", true);
+      return;
+    }
+    if (!view) {
+      this.notify("Open Agents Pane first.", true);
+      return;
+    }
+    const up = await this.ensureDaemon();
+    if (!up) {
+      this.notify("Cursor Sidecar: daemon unavailable for embed", true);
+      return;
+    }
+    await sleep(40);
+    const pane = view.getPaneRectPayload();
+    if (this.settings.borderlessCursorExperimental) {
+      pane.borderless = true;
+    }
+    const useNative = this.settings.embedBackend === "native_child";
+    if (useNative) {
+      pane.backend = "native_child";
+    }
+    try {
+      const result = await this.httpJson("POST", "/rpc", {
+        cmd: useNative ? "enter-native-agents-embed" : "enter-embedded-pane",
+        pane,
+        backend: useNative ? "native_child" : undefined,
+      });
+      if (!result || result.ok === false) {
+        const err = (result && result.error) || "enter-embedded-pane failed";
+        this._embedActive = false;
+        this._nativeVerified = false;
+        if (err === "agent_not_bound") {
+          this.notify("Bind Agents Window first.", true);
+          if (view.renderPaneUi) view.renderPaneUi("unbound");
+          return;
+        }
+        if (useNative) {
+          this.notify(`Native embed FAILED (no visual fallback): ${this._formatNativeFail(result)}`, true);
+          if (view.renderPaneUi) view.renderPaneUi("ready");
+          return;
+        }
+        this.notify(`Embed failed: ${String(err).slice(0, 200)}`, true);
+        return;
+      }
+      if (useNative) {
+        const emb = result.embedded_status || {};
+        const verified =
+          !!result.is_native_child_verified ||
+          !!emb.native_child ||
+          !!emb.is_native_child;
+        if (!verified) {
+          this._embedActive = false;
+          this._nativeVerified = false;
+          this.notify(`Native embed NOT verified: ${this._formatNativeFail(result)}`, true);
+          if (view.renderPaneUi) view.renderPaneUi("ready");
+          return;
+        }
+        this._embedActive = true;
+        this._nativeVerified = true;
+        view.renderPaneUi("anchor");
+        this._lastEmbedDiag = {
+          dom: pane,
+          placement: result.placement,
+          parent: result.agent_parent_hwnd,
+          WS_CHILD: result.WS_CHILD,
+          WS_POPUP: result.WS_POPUP,
+          verified: true,
+        };
+        this.notify(
+          `Native child OK GetParent=${result.agent_parent_hwnd} WS_CHILD=${result.WS_CHILD} WS_POPUP=${result.WS_POPUP}`
+        );
+        this.schedulePaneRectUpdate();
+        return;
+      }
+      this._embedActive = true;
+      this._nativeVerified = false;
+      view.renderPaneUi("embedded");
+      this._lastEmbedDiag = { dom: pane, placement: result.placement };
+      this.notify("Agents Window embedded in pane (visual)");
+      this.schedulePaneRectUpdate();
+    } catch (err) {
+      this._embedActive = false;
+      this._nativeVerified = false;
+      this.notify(`Embed error: ${err.message || err}`, true);
+    }
+  }
+
+  async exitEmbeddedMode({ closePane = false, fromViewClose = false } = {}) {
+    const wasActive = this._embedActive;
+    this._embedActive = false;
+    this._nativeVerified = false;
+    try {
+      if (wasActive && (await this.daemonHealthy())) {
+        await this.httpJson("POST", "/rpc", { cmd: "exit-embedded-pane" });
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    await this.refreshAgentsPaneUi();
+    if (closePane && !fromViewClose) {
+      const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_EMBEDDED_PANE);
+      for (const leaf of leaves) {
+        leaf.detach();
+      }
+    }
+    if (wasActive && !fromViewClose) {
+      this.notify("Exited Agents Pane (Editor unchanged)");
+    }
+  }
+
+  async enterNativeAgentsEmbed() {
+    await this.openNativeAgentsPane();
+  }
+
+  async recoverNativeAgents() {
+    try {
+      const up = await this.ensureDaemon();
+      if (!up) {
+        this.notify("Daemon unavailable", true);
+        return;
+      }
+      const result = await this.httpJson("POST", "/rpc", { cmd: "recover-native-child" });
+      if (!result || result.ok === false) {
+        this.notify(`Recover failed: ${String((result && result.error) || "rpc")}`, true);
+        return;
+      }
+      this._embedActive = false;
+      this.notify("Native Agents Window recovered");
+      await this.refreshAgentsPaneUi();
+    } catch (err) {
+      this.notify(`Recover error: ${err.message || err}`, true);
+    }
+  }
+
+  async tempHideAgentsChild() {
+    if (!this._embedActive || !this._embeddedPaneView) return;
+    const pane = this._embeddedPaneView.getPaneRectPayload();
+    pane.visible = false;
+    try {
+      await this.httpJson("POST", "/rpc", { cmd: "update-embedded-pane", pane });
+      this.notify("Agents child temporarily hidden");
+    } catch (_e) {
+      /* ignore */
+    }
   }
 
   vaultPath() {
@@ -763,9 +1522,13 @@ class CursorSidecarPlugin extends Plugin {
           } else if (result.attached === true) {
             this.notify("Cursor Sidecar: attached");
           } else if (result.attached === false) {
+            this._embedActive = false;
             this.notify("Cursor Sidecar: detached (windows restored)");
           } else {
             this.notify(`Cursor Sidecar: ${cmd} ok`);
+          }
+          if (cmd === "detach") {
+            this._embedActive = false;
           }
           return result;
         }
@@ -863,7 +1626,7 @@ class CursorSidecarSettingTab extends PluginSettingTab {
       text: `Binary: ${helper.mode === "packaged" && helper.binaryFound ? "Found" : helper.mode === "packaged" ? "Missing" : "n/a (source)"}`,
     });
     status.createEl("p", {
-      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.6.0"}`,
+      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.7.1-dev"}`,
     });
     const daemonLine = status.createEl("p", { text: "Daemon: …" });
     this.plugin
@@ -909,9 +1672,82 @@ class CursorSidecarSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("Embedded Agents Pane [Experimental]")
+      .setDesc(
+        "Places Cursor's New Agents Window over an Obsidian pane. Visual embed only — not the full Editor. Editor stays for Context Follow."
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(!!this.plugin.settings.embeddedPaneExperimental).onChange(async (value) => {
+          this.plugin.settings.embeddedPaneExperimental = !!value;
+          await this.plugin.saveSettings();
+          if (!value && this.plugin._embedActive) {
+            await this.plugin.exitEmbeddedMode({ closePane: true });
+          }
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Borderless Agents Window [Experimental]")
+      .setDesc("When embedding, strip Agents Window caption/thickframe only (not Editor). Default OFF.")
+      .addToggle((toggle) =>
+        toggle.setValue(!!this.plugin.settings.borderlessCursorExperimental).onChange(async (value) => {
+          this.plugin.settings.borderlessCursorExperimental = !!value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Agents Embed Backend")
+      .setDesc(
+        this.plugin.settings.embedBackend === "native_child"
+          ? "WARNING: Reparents the Cursor Agents Window into Obsidian using Win32 SetParent. Cursor/Electron updates may break this."
+          : "Visual (recommended) = SetWindowPos overlay. Native Child = highly experimental SetParent."
+      )
+      .addDropdown((dd) =>
+        dd
+          .addOption("visual", "Visual (recommended)")
+          .addOption("native_child", "Native Child (highly experimental)")
+          .setValue(this.plugin.settings.embedBackend === "native_child" ? "native_child" : "visual")
+          .onChange(async (value) => {
+            this.plugin.settings.embedBackend = value === "native_child" ? "native_child" : "visual";
+            await this.plugin.saveSettings();
+            try {
+              if (await this.plugin.daemonHealthy()) {
+                await this.plugin.httpJson("POST", "/rpc", {
+                  cmd: "set-embed-backend",
+                  backend: this.plugin.settings.embedBackend,
+                });
+              }
+            } catch (_e) {
+              /* ignore */
+            }
+            this.display();
+          })
+      );
+
     status.createEl("p", {
       text: `Context Follow: ${this.plugin.settings.contextFollow ? "On" : "Off"}`,
     });
+    status.createEl("p", {
+      text: `Embedded Pane: ${this.plugin.settings.embeddedPaneExperimental ? "On" : "Off"}${
+        this.plugin._embedActive ? " (active)" : ""
+      }${this.plugin._nativeVerified ? " native=verified" : ""}`,
+    });
+    if (this.plugin.settings.developerMode && this.plugin._lastEmbedDiag) {
+      const d = this.plugin._lastEmbedDiag;
+      const pl = d.placement || {};
+      status.createEl("p", {
+        text: `Embed diag: mode=${this.plugin._embedActive ? "pane" : "sidecar"} verified=${
+          d.verified != null ? d.verified : this.plugin._nativeVerified
+        } parent=${d.parent != null ? d.parent : "?"} WS_CHILD=${
+          d.WS_CHILD != null ? d.WS_CHILD : "?"
+        } WS_POPUP=${d.WS_POPUP != null ? d.WS_POPUP : "?"} visible=${
+          pl.visible != null ? pl.visible : "?"
+        }`,
+      });
+    }
     if (this.plugin._cfLastRelative) {
       status.createEl("p", {
         text: `Last sync: ${this.plugin._cfLastRelative}`,
@@ -1025,8 +1861,24 @@ class CursorSidecarSettingTab extends PluginSettingTab {
         btn.setButtonText("Detach").onClick(async () => this.plugin.runAction("detach"))
       )
       .addButton((btn) =>
+        btn.setButtonText("Bind Agents").onClick(async () => this.plugin.bindAgentsWindowFlow())
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Open Native Pane").onClick(async () => this.plugin.openNativeAgentsPane())
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Recover Native").onClick(async () => this.plugin.recoverNativeAgents())
+      )
+      .addButton((btn) =>
         btn.setButtonText("Status").onClick(async () => this.plugin.runAction("status", true))
       );
+    if (this.plugin.settings.developerMode) {
+      new Setting(containerEl)
+        .setName("Debug")
+        .addButton((btn) =>
+          btn.setButtonText("Bind Agents (debug)").onClick(async () => this.plugin.bindAgentsWindowFlow())
+        );
+    }
   }
 }
 
