@@ -3,7 +3,8 @@
 Order:
   1) refresh + existing valid binding
   2) enumerate+classify → unique AGENT (restore if hidden)
-  3) trigger: win32_menu → uia_menu → command_palette
+  3) trigger: win32_menu → alt_file_menu → uia_menu → command_palette
+     (ok only after new Agent HWND confirmed)
   4) wait by classification (not strict HWND diff of 1)
 Never visual fallback. Never bind AGENT as editor.
 """
@@ -38,15 +39,19 @@ log = logging.getLogger("cursor_sidecar.agents_auto")
 
 VK_CONTROL = 0x11
 VK_SHIFT = 0x10
+VK_MENU = 0x12  # Alt
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
+VK_DOWN = 0x28
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
+# Prefer exact "New Agents Window" — "Open/Agents Window" often switches layout
+# in the SAME Editor HWND (no new window). Never query bare "Agents Window".
 _PALETTE_QUERIES = (
     "New Agents Window",
-    "Agents Window",
+    "File: New Agents Window",
 )
 
 
@@ -137,6 +142,11 @@ def trigger_agents_window_via_palette(
     *,
     query: str | None = None,
 ) -> dict[str, Any]:
+    """Send palette keystrokes. ok=True only means keys were sent — caller must confirm HWND.
+
+    Do NOT press Down before Enter: the top match is already highlighted; Down would
+    select the second row (often "Open Agents Window" / layout switch, same HWND).
+    """
     eh = int(editor_hwnd_i or 0)
     if not eh or not win32gui.IsWindow(eh):
         return {"ok": False, "error": "editor_hwnd_invalid"}
@@ -144,21 +154,170 @@ def trigger_agents_window_via_palette(
     prev = get_foreground_hwnd()
     try:
         focus_window(eh)
-        time.sleep(0.2)
+        time.sleep(0.25)
         dismiss_palette()
+        time.sleep(0.1)
         open_command_palette()
-        type_text(q)
-        time.sleep(0.28)
-        tap_vk(VK_RETURN, pause=0.15)
-        time.sleep(0.35)
+        time.sleep(0.5)  # let palette UI mount
+        chord([VK_CONTROL, ord("A")], pause=0.05)
+        # Clipboard paste is more reliable than per-char Unicode SendInput in Electron
+        pasted = False
+        try:
+            import win32clipboard
+
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(q)
+            finally:
+                win32clipboard.CloseClipboard()
+            chord([VK_CONTROL, ord("V")], pause=0.08)
+            pasted = True
+        except Exception:
+            type_text(q)
+        time.sleep(0.65)  # let fuzzy filter settle on exact top hit
+        tap_vk(VK_RETURN, pause=0.2)
+        time.sleep(0.45)
         return {
             "ok": True,
+            "keys_sent": True,
             "trigger_method": "command_palette",
             "query": q,
+            "pasted": pasted,
             "prev_foreground": prev,
         }
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "trigger_method": "command_palette", "query": q}
+        return {
+            "ok": False,
+            "error": str(exc),
+            "trigger_method": "command_palette",
+            "query": q,
+        }
+
+
+def trigger_agents_window_via_alt_file_menu(editor_hwnd_i: int) -> dict[str, Any]:
+    """Keyboard: Alt, F → type 'New Agents Window' → Enter (Electron menu bar)."""
+    eh = int(editor_hwnd_i or 0)
+    if not eh or not win32gui.IsWindow(eh):
+        return {"ok": False, "error": "editor_hwnd_invalid"}
+    try:
+        focus_window(eh)
+        time.sleep(0.2)
+        dismiss_palette()
+        # Sequential Alt then F (more reliable than Alt+F chord on Electron)
+        tap_vk(VK_MENU, pause=0.15)
+        tap_vk(ord("F"), pause=0.45)
+        type_text("New Agents Window", pause=0.025)
+        time.sleep(0.4)
+        tap_vk(VK_RETURN, pause=0.2)
+        time.sleep(0.4)
+        return {
+            "ok": True,
+            "keys_sent": True,
+            "trigger_method": "alt_file_menu",
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "trigger_method": "alt_file_menu"}
+
+
+def _confirm_agent_appeared(
+    *,
+    before: list[dict[str, Any]],
+    process_name: str,
+    editor_hwnd_i: int,
+    timeout_s: float = 3.0,
+    classify_list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    return wait_for_agent_classified(
+        process_name=process_name,
+        editor_hwnd_i=editor_hwnd_i,
+        before=before,
+        timeout_s=timeout_s,
+        poll_s=0.15,
+        classify_list_fn=classify_list_fn,
+    )
+
+
+def trigger_new_agents_window(
+    editor_hwnd_i: int,
+    *,
+    process_name: str = "Cursor.exe",
+    classify_list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
+    list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """
+    Try triggers in order; only return ok=True when a new Agent HWND is confirmed.
+    Priority: win32_menu → alt_file_menu → uia_menu → command_palette
+    """
+    list_fn = list_fn or list_cursor_top_level
+    classify_list_fn = classify_list_fn or list_cursor_windows_classified
+    eh = int(editor_hwnd_i)
+    before = list_fn(process_name)
+    attempts: list[dict[str, Any]] = []
+
+    def _try(label: str, result: dict[str, Any], confirm_s: float = 3.2) -> dict[str, Any] | None:
+        attempts.append({"step": label, **{k: result.get(k) for k in (
+            "ok", "error", "trigger_method", "query", "keys_sent"
+        )}})
+        if result.get("error") == "menu_item_disabled":
+            return {**result, "should_rescan": True, "attempts": attempts}
+        if not result.get("ok") and not result.get("keys_sent"):
+            return None
+        confirmed = _confirm_agent_appeared(
+            before=before,
+            process_name=process_name,
+            editor_hwnd_i=eh,
+            timeout_s=confirm_s,
+            classify_list_fn=classify_list_fn,
+        )
+        if confirmed.get("ok"):
+            return {
+                **result,
+                "ok": True,
+                "confirmed": True,
+                "confirm": confirmed,
+                "attempts": attempts,
+                "trigger_method": result.get("trigger_method") or label,
+            }
+        attempts[-1]["confirm_error"] = confirmed.get("error") or "no_new_window"
+        return None
+
+    # A: Win32 GetMenu
+    hit = _try("win32_menu", trigger_new_agents_via_win32_menu(eh))
+    if hit:
+        return hit
+
+    # B: Alt → File → New Agents Window (Electron)
+    hit = _try("alt_file_menu", trigger_agents_window_via_alt_file_menu(eh))
+    if hit:
+        return hit
+
+    # C: UIA
+    try:
+        from agents_uia import invoke_file_new_agents_window
+
+        uia = invoke_file_new_agents_window(eh)
+    except Exception as exc:
+        uia = {"ok": False, "error": str(exc), "trigger_method": "uia_menu"}
+    hit = _try("uia_menu", uia)
+    if hit:
+        return hit
+
+    # D: Command palette — exact New Agents Window only (avoid layout-switch commands)
+    for query in _PALETTE_QUERIES:
+        pal = trigger_agents_window_via_palette(eh, query=query)
+        hit = _try(f"command_palette:{query}", pal, confirm_s=4.0)
+        if hit:
+            return hit
+
+    return {
+        "ok": False,
+        "error": "trigger_failed_no_new_window",
+        "trigger_method": None,
+        "attempts": attempts,
+        "hint": "Palette/menu keys sent but no new Cursor HWND appeared",
+        "before_count": len(before),
+    }
 
 
 def _diag_counts(classified: list[dict[str, Any]]) -> dict[str, int]:
@@ -260,41 +419,6 @@ def wait_for_agent_classified(
     return last
 
 
-def trigger_new_agents_window(editor_hwnd_i: int) -> dict[str, Any]:
-    """Priority: win32_menu → uia_menu → command_palette."""
-    eh = int(editor_hwnd_i)
-    # A: Win32 menu
-    menu = trigger_new_agents_via_win32_menu(eh)
-    if menu.get("ok"):
-        return menu
-    if menu.get("error") == "menu_item_disabled":
-        return {**menu, "should_rescan": True}
-
-    # B: UIA
-    try:
-        from agents_uia import invoke_file_new_agents_window
-
-        uia = invoke_file_new_agents_window(eh)
-        if uia.get("ok"):
-            return uia
-        menu["uia"] = uia
-    except Exception as exc:
-        menu["uia"] = {"ok": False, "error": str(exc)}
-
-    # C: palette fallback
-    for query in _PALETTE_QUERIES:
-        pal = trigger_agents_window_via_palette(eh, query=query)
-        if pal.get("ok"):
-            return pal
-        menu.setdefault("palette_attempts", []).append(pal)
-    return {
-        "ok": False,
-        "error": "trigger_failed",
-        "win32_menu": menu,
-        "trigger_method": None,
-    }
-
-
 def ensure_agents_window_bound(
     cfg: dict[str, Any],
     state: dict[str, Any],
@@ -368,9 +492,15 @@ def ensure_agents_window_bound(
 
     prev_fg = get_foreground_hwnd()
     try:
-        trig = trigger_fn(eh)
-    except TypeError:
-        trig = trigger_fn(eh)  # type: ignore[misc]
+        try:
+            trig = trigger_fn(
+                eh,
+                process_name=proc,
+                classify_list_fn=classify_list_fn,
+                list_fn=list_fn,
+            )
+        except TypeError:
+            trig = trigger_fn(eh)
     except Exception as exc:
         trig = {"ok": False, "error": str(exc)}
 
@@ -407,6 +537,38 @@ def ensure_agents_window_bound(
                     )},
                 }
 
+    # Trigger already confirmed a new Agent HWND during method loop
+    if trig.get("confirmed") and isinstance(trig.get("confirm"), dict) and trig["confirm"].get("ok"):
+        cand = trig["confirm"]["candidate"]
+        hwnd = int(cand["hwnd"])
+        snap = bind_fn(hwnd, process_name=proc)
+        restore_foreground_hwnd(prev_fg)
+        if not snap:
+            return {
+                "ok": False,
+                "error": "agent_snapshot_failed",
+                "trigger": trig,
+                "trigger_method": trig.get("trigger_method"),
+            }
+        state["cursor_agent"] = snap
+        state["agent_stale_reason"] = None
+        state["agent_bound"] = True
+        state["agent_bind_before"] = None
+        return {
+            "ok": True,
+            "source": "auto_launch_confirmed",
+            "agent_hwnd": hwnd,
+            "trigger": trig,
+            "trigger_method": trig.get("trigger_method"),
+            "before_cursor_windows": before_snapshot,
+            "after_cursor_windows": trig["confirm"].get("after_cursor_windows"),
+            "refresh": refresh,
+            "match": trig["confirm"].get("match"),
+            "classified_editor_count": trig["confirm"].get("classified_editor_count"),
+            "classified_agent_count": trig["confirm"].get("classified_agent_count"),
+            "unknown_count": trig["confirm"].get("unknown_count"),
+        }
+
     if not trig.get("ok"):
         restore_foreground_hwnd(prev_fg)
         # Final rescan
@@ -430,7 +592,7 @@ def ensure_agents_window_bound(
                 }
         return {
             "ok": False,
-            "error": "agent_window_not_found",
+            "error": trig.get("error") or "agent_window_not_found",
             "trigger": trig,
             "trigger_method": trig.get("trigger_method"),
             "before_cursor_windows": before_snapshot,

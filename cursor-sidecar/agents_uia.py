@@ -132,7 +132,7 @@ def invoke_file_new_agents_window(hwnd: int) -> dict[str, Any]:
 
         # Try direct descendant first
         target = None
-        for label in ("New Agents Window", "New Agent Window", "Agents Window"):
+        for label in ("New Agents Window", "New Agent Window"):
             target = _find_by_name(root, label)
             if target:
                 break
@@ -151,7 +151,7 @@ def invoke_file_new_agents_window(hwnd: int) -> dict[str, Any]:
                         expand = None
                 except Exception:
                     pass
-                for label in ("New Agents Window", "New Agent Window", "Agents Window"):
+                for label in ("New Agents Window", "New Agent Window"):
                     target = _find_by_name(root, label)
                     if target:
                         break
