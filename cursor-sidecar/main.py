@@ -29,6 +29,15 @@ from geometry import (
     recover_state_dict,
     resolve_preset,
 )
+from runtime_paths import (
+    DEFAULT_CONFIG_VALUES,
+    VERSION,
+    build_self_command,
+    get_paths,
+    init_runtime,
+    is_frozen,
+    runtime_mode,
+)
 from window import (
     apply_window_placement,
     arrange_bound_windows,
@@ -50,15 +59,17 @@ from window import (
 )
 from win_events import LiveFollowService
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG = ROOT / "config.json"
-PID_FILE = ROOT / ".sidecar.pid"
-DAEMON_PID_FILE = ROOT / ".sidecar.daemon.pid"
-DAEMON_META_FILE = ROOT / ".sidecar.daemon.json"
-TOKEN_FILE = ROOT / ".sidecar.daemon.token"
-STATE_FILE = ROOT / ".sidecar.state.json"
-
-VERSION = "0.4.1"
+# Path globals — refreshed by sync_path_globals() / init_runtime()
+_paths = init_runtime()
+ROOT = _paths.code_dir  # code/package dir (compat alias)
+CODE_DIR = _paths.code_dir
+DATA_DIR = _paths.data_dir
+DEFAULT_CONFIG = _paths.config_path
+PID_FILE = _paths.follow_pid_path
+DAEMON_PID_FILE = _paths.daemon_pid_path
+DAEMON_META_FILE = _paths.daemon_meta_path
+TOKEN_FILE = _paths.daemon_token_path
+STATE_FILE = _paths.state_path
 
 LIFECYCLE_LOCK = threading.RLock()
 _FOLLOW: LiveFollowService | None = None
@@ -67,6 +78,22 @@ _STOP_DAEMON = threading.Event()
 _DAEMON_HTTP_SERVER: ThreadingHTTPServer | None = None
 
 LOCALHOST_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def sync_path_globals(data_dir_override: str | None = None) -> None:
+    """Rebind module path globals after --data-dir / env override."""
+    global ROOT, CODE_DIR, DATA_DIR, DEFAULT_CONFIG, PID_FILE
+    global DAEMON_PID_FILE, DAEMON_META_FILE, TOKEN_FILE, STATE_FILE, _paths
+    _paths = init_runtime(data_dir_override=data_dir_override)
+    ROOT = _paths.code_dir
+    CODE_DIR = _paths.code_dir
+    DATA_DIR = _paths.data_dir
+    DEFAULT_CONFIG = _paths.config_path
+    PID_FILE = _paths.follow_pid_path
+    DAEMON_PID_FILE = _paths.daemon_pid_path
+    DAEMON_META_FILE = _paths.daemon_meta_path
+    TOKEN_FILE = _paths.daemon_token_path
+    STATE_FILE = _paths.state_path
 
 
 def normalize_daemon_bind_host(host: str | None) -> str:
@@ -86,10 +113,24 @@ def daemon_endpoint_args(host: str, port: int) -> list[str]:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"config not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    path = Path(path)
+    disk: dict[str, Any] = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            disk = loaded
+    else:
+        # Frozen / first-run: bootstrap defaults into DATA_DIR (never fail "config not found").
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        bootstrap = dict(DEFAULT_CONFIG_VALUES)
+        atomic_write_text(
+            path,
+            json.dumps(bootstrap, indent=2, ensure_ascii=False) + "\n",
+        )
+        disk = bootstrap
+
+    cfg: dict[str, Any] = {**DEFAULT_CONFIG_VALUES, **disk}
     # Preset drives ratios (v0.3). Legacy explicit ratios still accepted if no preset.
     preset = str(cfg.get("preset") or "normal")
     try:
@@ -98,13 +139,11 @@ def load_config(path: Path) -> dict[str, Any]:
     except ValueError:
         preset = "normal"
         o, c = ratios_for_preset(preset)
-    # Allow explicit ratio override only when preset key absent in file... always use preset.
     cfg["preset"] = preset
     cfg["obsidian_ratio"] = o
     cfg["cursor_ratio"] = c
     cfg["gap"] = int(cfg.get("gap", 0))
     cfg["monitor"] = cfg.get("monitor", None)
-    # Deprecated polling knobs (kept for compat; Live Follow ignores them)
     cfg["poll_ms"] = int(cfg.get("poll_ms", 500))
     cfg["follow_obsidian"] = bool(cfg.get("follow_obsidian", False))
     cfg["launch_cursor_if_missing"] = bool(cfg.get("launch_cursor_if_missing", True))
@@ -117,7 +156,8 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def update_config_file(updates: dict[str, Any]) -> None:
-    path = ROOT / "config.json"
+    path = Path(DEFAULT_CONFIG)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     raw: dict[str, Any] = {}
     if path.is_file():
         try:
@@ -126,6 +166,8 @@ def update_config_file(updates: dict[str, Any]) -> None:
                 raw = loaded
         except (OSError, json.JSONDecodeError):
             raw = {}
+    if not raw:
+        raw = dict(DEFAULT_CONFIG_VALUES)
     raw.update(updates)
     atomic_write_text(path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
 
@@ -194,6 +236,10 @@ def read_daemon_meta() -> dict[str, Any]:
         return {}
 
 
+def _norm_exe_path(value: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expandvars(str(value))))
+
+
 def write_daemon_meta(
     *,
     pid: int,
@@ -206,14 +252,21 @@ def write_daemon_meta(
             process_create_time = float(psutil.Process(int(pid)).create_time())
         except (psutil.Error, ValueError, TypeError):
             process_create_time = 0.0
-    payload = {
+    mode = runtime_mode()
+    exe = str(Path(sys.executable).resolve())
+    payload: dict[str, Any] = {
         "pid": int(pid),
         "process_create_time": float(process_create_time),
         "host": normalize_daemon_bind_host(host),
         "port": int(port),
         "started_at": time.time(),
-        "main_py": str(ROOT / "main.py"),
+        "runtime_mode": mode,
+        "executable_path": exe,
+        "entrypoint": "frozen" if mode == "frozen" else "main.py",
+        "version": VERSION,
     }
+    if mode == "source":
+        payload["main_py"] = str(CODE_DIR / "main.py")
     atomic_write_text(
         DAEMON_META_FILE,
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -248,15 +301,43 @@ def verify_sidecar_daemon_process(meta: dict[str, Any]) -> dict[str, Any]:
             cmdline = " ".join(proc.cmdline()).lower()
         except (psutil.Error, OSError):
             cmdline = ""
-        # Must look like: python ... main.py ... daemon
-        if "main.py" not in cmdline or "daemon" not in cmdline:
+        try:
+            live_exe = proc.exe() or ""
+        except (psutil.Error, OSError, AttributeError):
+            live_exe = ""
+
+        mode = str(meta.get("runtime_mode") or "").strip().lower()
+        if not mode:
+            mode = "source" if "main.py" in cmdline else "frozen"
+        expected_exe = str(meta.get("executable_path") or "").strip()
+
+        if "daemon" not in cmdline:
             return {"ok": False, "reason": "not_sidecar_daemon", "pid": pid}
+
+        if mode == "frozen":
+            if expected_exe and live_exe:
+                if _norm_exe_path(live_exe) != _norm_exe_path(expected_exe):
+                    return {"ok": False, "reason": "exe_mismatch", "pid": pid}
+            else:
+                base = os.path.basename(live_exe).lower()
+                if "cursor-sidecar" not in base:
+                    return {"ok": False, "reason": "not_sidecar_daemon", "pid": pid}
+        else:
+            # SOURCE (and legacy meta): python + main.py + daemon
+            if "main.py" not in cmdline:
+                return {"ok": False, "reason": "not_sidecar_daemon", "pid": pid}
+            if expected_exe and live_exe:
+                if _norm_exe_path(live_exe) != _norm_exe_path(expected_exe):
+                    return {"ok": False, "reason": "exe_mismatch", "pid": pid}
+
         return {
             "ok": True,
             "pid": pid,
             "host": str(meta.get("host") or ""),
             "port": int(meta.get("port") or 0),
             "process_create_time": live_ctime,
+            "runtime_mode": mode,
+            "executable_path": live_exe or expected_exe,
         }
     except psutil.Error:
         return {"ok": False, "reason": "gone", "pid": pid}
@@ -1411,16 +1492,18 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    argv = build_self_command(
+        "--data-dir",
+        str(DATA_DIR),
+        "-c",
+        str(DEFAULT_CONFIG),
+        "daemon",
+        *daemon_endpoint_args(host, port),
+    )
     subprocess.Popen(
-        [
-            sys.executable,
-            str(ROOT / "main.py"),
-            "-c",
-            str(DEFAULT_CONFIG),
-            "daemon",
-            *daemon_endpoint_args(host, port),
-        ],
-        cwd=str(ROOT),
+        argv,
+        cwd=str(DATA_DIR if is_frozen() else CODE_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=creationflags,
@@ -1437,13 +1520,28 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
     return 0
 
 
+def _peek_data_dir(argv: list[str]) -> str | None:
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--data-dir" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--data-dir="):
+            return tok.split("=", 1)[1]
+        i += 1
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.4 Context Bridge")
+    p = argparse.ArgumentParser(prog="cursor-sidecar", description="Cursor Sidecar v0.5 Zero-config Packaging")
     p.add_argument("-c", "--config", default=str(DEFAULT_CONFIG))
+    p.add_argument("--data-dir", default=None, help="Override writable DATA_DIR")
+    p.add_argument("--version", action="store_true", help="Print helper version and exit")
     p.add_argument("--workspace", default=None)
     p.add_argument("--file", default=None)
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
 
+    sub.add_parser("version", help="Print helper version")
     sub.add_parser("attach", help="Attach Sidecar (save originals + arrange)")
     sub.add_parser("detach", help="Detach and restore original window placements")
     sub.add_parser("click", help="Attach if detached, Detach if attached")
@@ -1486,9 +1584,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    data_override = _peek_data_dir(raw)
+    if data_override:
+        sync_path_globals(data_override)
+
     dpi = enable_dpi_awareness()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
+    if getattr(args, "data_dir", None):
+        sync_path_globals(str(args.data_dir))
+
+    if bool(getattr(args, "version", False)) or args.command == "version":
+        print(VERSION)
+        return 0
+    if not args.command:
+        parser.error("command required (or pass --version)")
+
     cfg = load_config(Path(args.config))
     common = {"workspace": args.workspace, "file_path": args.file}
 

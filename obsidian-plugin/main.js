@@ -14,6 +14,8 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fi
 const DEFAULT_SETTINGS = {
   sidecarDir: "",
   pythonPath: "",
+  developerMode: false,
+  dataDirOverride: "",
   daemonHost: "127.0.0.1",
   daemonPort: 27845,
   liveSidecar: true,
@@ -131,6 +133,8 @@ class CursorSidecarPlugin extends Plugin {
     );
 
     this.addSettingTab(new CursorSidecarSettingTab(this.app, this));
+    // Fire-and-forget version mismatch notice (packaged only)
+    this.checkHelperVersionMismatch().catch(() => {});
   }
 
   onunload() {}
@@ -144,6 +148,56 @@ class CursorSidecarPlugin extends Plugin {
     new Notice(message, isError ? 8000 : 4000);
   }
 
+  vaultPath() {
+    const adapter = this.app.vault.adapter;
+    if (adapter && typeof adapter.getBasePath === "function") {
+      return adapter.getBasePath();
+    }
+    return adapter && adapter.basePath ? adapter.basePath : "";
+  }
+
+  resolvePluginDir() {
+    // Prefer Obsidian-provided absolute plugin dir when available
+    if (this.manifest && typeof this.manifest.dir === "string" && this.manifest.dir) {
+      const dir = this.manifest.dir;
+      if (path.isAbsolute(dir) && fs.existsSync(dir)) return dir;
+      const base = this.vaultPath();
+      if (base) {
+        const joined = path.join(base, dir);
+        if (fs.existsSync(joined)) return joined;
+      }
+    }
+    const base = this.vaultPath();
+    const configDir = (this.app.vault && this.app.vault.configDir) || ".obsidian";
+    const id = (this.manifest && this.manifest.id) || "cursor-sidecar";
+    return path.join(base, configDir, "plugins", id);
+  }
+
+  resolveHelper() {
+    const pluginDir = this.resolvePluginDir();
+    const packaged = path.join(pluginDir, "bin", "cursor-sidecar.exe");
+    if (fs.existsSync(packaged)) {
+      return {
+        mode: "packaged",
+        command: packaged,
+        argsPrefix: [],
+        cwd: pluginDir,
+        binaryFound: true,
+      };
+    }
+    const dir = (this.settings.sidecarDir || "").trim();
+    const mainPy = path.join(dir, "main.py");
+    const py = this.resolvePython();
+    return {
+      mode: "developer",
+      command: py,
+      argsPrefix: [mainPy],
+      cwd: dir || undefined,
+      binaryFound: false,
+      mainPy,
+    };
+  }
+
   resolvePython() {
     const configured = (this.settings.pythonPath || "").trim();
     if (configured && fs.existsSync(configured)) return configured;
@@ -155,34 +209,96 @@ class CursorSidecarPlugin extends Plugin {
     return "python";
   }
 
-  resolveMainPy() {
-    return path.join((this.settings.sidecarDir || "").trim(), "main.py");
+  resolveDataDir() {
+    const override = (this.settings.dataDirOverride || "").trim();
+    if (override) return override;
+    const envOverride = (process.env.CURSOR_SIDECAR_DATA_DIR || "").trim();
+    if (envOverride) return envOverride;
+    const helper = this.resolveHelper();
+    if (helper.mode === "packaged") {
+      const local = process.env.LOCALAPPDATA;
+      if (local) return path.join(local, "CursorSidecar");
+      return path.join(process.env.USERPROFILE || "", "AppData", "Local", "CursorSidecar");
+    }
+    return (this.settings.sidecarDir || "").trim();
   }
 
-  pathsConfigured() {
+  helperConfigured() {
+    const helper = this.resolveHelper();
+    if (helper.mode === "packaged") return true;
     const dir = (this.settings.sidecarDir || "").trim();
     if (!dir) {
       this.notify(
-        "Cursor Sidecar: set Sidecar directory in Settings → Cursor Sidecar",
+        "Cursor Sidecar: enable Developer mode and set Sidecar source directory, or install the packaged release.",
         true
       );
       return false;
     }
-    if (!fs.existsSync(this.resolveMainPy())) {
+    if (!fs.existsSync(helper.mainPy)) {
       this.notify(`Cursor Sidecar: main.py not found in ${dir}`, true);
       return false;
     }
     return true;
   }
 
-  vaultPath() {
-    return this.app.vault.adapter.basePath;
+  /** @deprecated use helperConfigured */
+  pathsConfigured() {
+    return this.helperConfigured();
+  }
+
+  resolveDaemonToken() {
+    const dataDir = this.resolveDataDir();
+    if (!dataDir) return "";
+    const tokenPath = path.join(dataDir, ".sidecar.daemon.token");
+    try {
+      if (fs.existsSync(tokenPath)) {
+        return fs.readFileSync(tokenPath, "utf8").trim();
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    return "";
+  }
+
+  majorMinor(ver) {
+    const parts = String(ver || "")
+      .trim()
+      .split(".")
+      .map((x) => Number(x));
+    return `${parts[0] || 0}.${parts[1] || 0}`;
+  }
+
+  async checkHelperVersionMismatch() {
+    const helper = this.resolveHelper();
+    if (helper.mode !== "packaged") return;
+    try {
+      const result = await this.spawnAsync(helper.command, ["--version"], helper.cwd);
+      if (result.code !== 0) return;
+      const helperVer = (result.stdout || "").trim().split(/\r?\n/)[0].trim();
+      const pluginVer = (this.manifest && this.manifest.version) || "";
+      if (helperVer && pluginVer && this.majorMinor(helperVer) !== this.majorMinor(pluginVer)) {
+        this.notify("Cursor Sidecar helper version mismatch", true);
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
+  async probeHelperVersion() {
+    const helper = this.resolveHelper();
+    if (helper.mode !== "packaged") return null;
+    try {
+      const result = await this.spawnAsync(helper.command, ["--version"], helper.cwd);
+      if (result.code !== 0) return null;
+      return (result.stdout || "").trim().split(/\r?\n/)[0].trim() || null;
+    } catch (_e) {
+      return null;
+    }
   }
 
   getCurrentEditorContext() {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter) && typeof adapter.getBasePath !== "function") {
-      // Desktop FileSystemAdapter required for absolute paths
       if (!adapter || typeof adapter.basePath !== "string") {
         return { ok: false, error: "desktop_filesystem_required" };
       }
@@ -198,7 +314,6 @@ class CursorSidecarPlugin extends Plugin {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (view && view.editor) {
       const cur = view.editor.getCursor();
-      // Obsidian is 0-based; Cursor Desktop expects 1-based
       line = cur.line + 1;
       column = cur.ch + 1;
     }
@@ -226,7 +341,7 @@ class CursorSidecarPlugin extends Plugin {
   }
 
   async openVaultInCursor() {
-    if (!this.pathsConfigured()) return null;
+    if (!this.helperConfigured()) return null;
     const vaultRoot = this.vaultPath();
     this.notify("Cursor Sidecar: opening vault in Cursor…");
     try {
@@ -274,7 +389,7 @@ class CursorSidecarPlugin extends Plugin {
   }
 
   async openAbsoluteInCursor(vaultRoot, absPath, line, column) {
-    if (!this.pathsConfigured()) return null;
+    if (!this.helperConfigured()) return null;
     this.notify("Cursor Sidecar: opening note in Cursor…");
     try {
       const up = await this.ensureDaemon();
@@ -313,30 +428,21 @@ class CursorSidecarPlugin extends Plugin {
     }
   }
 
-  resolveDaemonToken() {
-    const dir = (this.settings.sidecarDir || "").trim();
-    if (!dir) return "";
-    const tokenPath = path.join(dir, ".sidecar.daemon.token");
-    try {
-      if (fs.existsSync(tokenPath)) {
-        return fs.readFileSync(tokenPath, "utf8").trim();
-      }
-    } catch (_e) {
-      /* ignore */
+  helperFrontArgs() {
+    const dataDir = this.resolveDataDir();
+    const args = [];
+    if (dataDir) {
+      args.push("--data-dir", dataDir);
     }
-    return "";
+    return args;
   }
 
   async ensureDaemon() {
     if (await this.daemonHealthy()) return true;
-    if (!this.pathsConfigured()) return false;
+    if (!this.helperConfigured()) return false;
     const host = this.settings.daemonHost || "127.0.0.1";
     const port = String(Number(this.settings.daemonPort) || 27845);
-    await this.spawnAsync(
-      this.resolvePython(),
-      [this.resolveMainPy(), "daemon-start", "--host", host, "--port", port],
-      this.settings.sidecarDir
-    );
+    await this.runHelper(["daemon-start", "--host", host, "--port", port]);
     for (let i = 0; i < 15; i++) {
       await sleep(250);
       if (await this.daemonHealthy()) return true;
@@ -384,7 +490,6 @@ class CursorSidecarPlugin extends Plugin {
         }
         this.notify("Live Sidecar OFF (windows stay; follow stopped)");
       }
-      // OFF + daemon down: nothing to stop
     } catch (err) {
       this.notify(`Live Sidecar toggle error: ${err.message || err}`, true);
     }
@@ -456,7 +561,7 @@ class CursorSidecarPlugin extends Plugin {
   }
 
   async runAction(cmd, showRaw = false) {
-    if (!this.pathsConfigured()) return null;
+    if (!this.helperConfigured()) return null;
     this.notify(`Cursor Sidecar: ${cmd}…`);
     try {
       if (this.settings.liveSidecar) {
@@ -486,34 +591,31 @@ class CursorSidecarPlugin extends Plugin {
         }
         this.notify("Cursor Sidecar: daemon unavailable — falling back to one-shot CLI", true);
       }
-      return await this.runCli(cmd, showRaw);
+      return await this.runHelperCommand(cmd, showRaw);
     } catch (err) {
       this.notify(`Cursor Sidecar error: ${err.message || err}`, true);
       return null;
     }
   }
 
-  async runCli(command, returnStdout = false, extraFrontArgs = []) {
-    const mainPy = this.resolveMainPy();
-    const finalArgs = [mainPy, ...extraFrontArgs];
+  async runHelper(args) {
+    const helper = this.resolveHelper();
+    const front = this.helperFrontArgs();
+    const finalArgs = [...helper.argsPrefix, ...front, ...args];
+    return this.spawnAsync(helper.command, finalArgs, helper.cwd);
+  }
+
+  async runHelperCommand(command, returnStdout = false) {
+    const extra = [];
     if (
       this.settings.openVaultInCursor &&
-      (command === "click" || command === "attach" || command === "dock") &&
-      !extraFrontArgs.includes("--workspace")
+      (command === "click" || command === "attach" || command === "dock")
     ) {
-      finalArgs.push("--workspace", this.vaultPath());
+      extra.push("--workspace", this.vaultPath());
     }
-    if (command === "status") {
-      finalArgs.push("status", "--json");
-    } else {
-      finalArgs.push(command);
-    }
-
-    const result = await this.spawnAsync(
-      this.resolvePython(),
-      finalArgs,
-      this.settings.sidecarDir
-    );
+    const cmdArgs =
+      command === "status" ? [...extra, "status", "--json"] : [...extra, command];
+    const result = await this.runHelper(cmdArgs);
     if (result.code !== 0) {
       const errText = (result.stderr || result.stdout || `exit ${result.code}`).trim();
       this.notify(`Cursor Sidecar failed: ${errText.slice(0, 300)}`, true);
@@ -571,18 +673,32 @@ class CursorSidecarSettingTab extends PluginSettingTab {
       text: "Attach real Cursor Desktop beside Obsidian. With Live Sidecar on, Cursor follows Obsidian while attached.",
     });
 
-    new Setting(containerEl)
-      .setName("Sidecar directory")
-      .setDesc("Required. Folder with main.py / config.json / .venv")
-      .addText((text) =>
-        text
-          .setPlaceholder("D:\\…\\cursor-sidecar")
-          .setValue(this.plugin.settings.sidecarDir)
-          .onChange(async (value) => {
-            this.plugin.settings.sidecarDir = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+    const helper = this.plugin.resolveHelper();
+    const status = containerEl.createDiv({ cls: "cursor-sidecar-status" });
+    status.createEl("h3", { text: "Status" });
+    status.createEl("p", {
+      text: `Helper: ${helper.mode === "packaged" ? "Packaged" : "Developer"}`,
+    });
+    status.createEl("p", {
+      text: `Binary: ${helper.mode === "packaged" && helper.binaryFound ? "Found" : helper.mode === "packaged" ? "Missing" : "n/a (source)"}`,
+    });
+    status.createEl("p", {
+      text: `Version: ${(this.plugin.manifest && this.plugin.manifest.version) || "0.5.0"}`,
+    });
+    const daemonLine = status.createEl("p", { text: "Daemon: …" });
+    this.plugin
+      .daemonHealthy()
+      .then((ok) => {
+        daemonLine.setText(`Daemon: ${ok ? "Running" : "Stopped"}`);
+      })
+      .catch(() => {
+        daemonLine.setText("Daemon: Stopped");
+      });
+    this.plugin.probeHelperVersion().then((ver) => {
+      if (ver) {
+        status.createEl("p", { text: `Helper version: ${ver}` });
+      }
+    });
 
     new Setting(containerEl)
       .setName("Live Sidecar")
@@ -591,19 +707,6 @@ class CursorSidecarSettingTab extends PluginSettingTab {
         toggle.setValue(!!this.plugin.settings.liveSidecar).onChange(async (value) => {
           await this.plugin.applyLiveSidecarSetting(value);
         })
-      );
-
-    new Setting(containerEl)
-      .setName("Python path")
-      .setDesc("Optional. Defaults to sidecar .venv\\Scripts\\python.exe")
-      .addText((text) =>
-        text
-          .setPlaceholder("…\\.venv\\Scripts\\python.exe")
-          .setValue(this.plugin.settings.pythonPath)
-          .onChange(async (value) => {
-            this.plugin.settings.pythonPath = value.trim();
-            await this.plugin.saveSettings();
-          })
       );
 
     new Setting(containerEl)
@@ -624,12 +727,7 @@ class CursorSidecarSettingTab extends PluginSettingTab {
         })
       );
 
-    containerEl.createEl("h3", { text: "Advanced" });
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text: "Daemon host/port (usually leave defaults).",
-    });
-
+    containerEl.createEl("h3", { text: "Daemon" });
     new Setting(containerEl)
       .setName("Daemon host")
       .setDesc("localhost only")
@@ -655,6 +753,59 @@ class CursorSidecarSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl)
+      .setName("Developer mode")
+      .setDesc("Show source-directory / Python settings for local development.")
+      .addToggle((toggle) =>
+        toggle.setValue(!!this.plugin.settings.developerMode).onChange(async (value) => {
+          this.plugin.settings.developerMode = !!value;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
+    if (this.plugin.settings.developerMode) {
+      containerEl.createEl("h3", { text: "Advanced / Developer" });
+      new Setting(containerEl)
+        .setName("Sidecar source directory")
+        .setDesc("Folder with main.py (developer fallback when packaged exe is absent)")
+        .addText((text) =>
+          text
+            .setPlaceholder("D:\\…\\cursor-sidecar")
+            .setValue(this.plugin.settings.sidecarDir)
+            .onChange(async (value) => {
+              this.plugin.settings.sidecarDir = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(containerEl)
+        .setName("Python path")
+        .setDesc("Optional. Defaults to sidecar .venv\\Scripts\\python.exe")
+        .addText((text) =>
+          text
+            .setPlaceholder("…\\.venv\\Scripts\\python.exe")
+            .setValue(this.plugin.settings.pythonPath)
+            .onChange(async (value) => {
+              this.plugin.settings.pythonPath = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(containerEl)
+        .setName("Data directory override")
+        .setDesc("Optional. Same as CURSOR_SIDECAR_DATA_DIR / --data-dir")
+        .addText((text) =>
+          text
+            .setPlaceholder("%LOCALAPPDATA%\\CursorSidecar")
+            .setValue(this.plugin.settings.dataDirOverride || "")
+            .onChange(async (value) => {
+              this.plugin.settings.dataDirOverride = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+    }
 
     new Setting(containerEl)
       .setName("Actions")

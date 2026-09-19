@@ -4,7 +4,15 @@ cursor-sidecar/*.pyc
 cursor-sidecar/.sidecar.pid
 cursor-sidecar/.sidecar.daemon.pid
 cursor-sidecar/.sidecar.daemon.token
+cursor-sidecar/.sidecar.daemon.json
 cursor-sidecar/.sidecar.state.json
 cursor-sidecar/*.state.corrupt
+cursor-sidecar/.pytest_cache/
+.packaging-venv/
+build/
+dist/
+release/
+**/__pycache__/
+*.pyc
 .DS_Store
 Thumbs.db

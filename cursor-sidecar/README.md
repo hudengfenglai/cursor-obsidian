@@ -1,8 +1,19 @@
-# Cursor Sidecar v0.4.1 — Live Sidecar + Context Bridge
+# Cursor Sidecar v0.5.0 — Zero-config Packaging
 
 Dock the **real Cursor Desktop** beside Obsidian on Windows, keep Cursor
 stuck to Obsidian’s right edge while attached, and open the current note
-in that same bound Editor.
+in that same bound Editor — **without installing Python**.
+
+## End-user install
+
+1. Download `cursor-sidecar-v0.5.0-windows-x64.zip`
+2. Unzip to `<vault>/<configDir>/plugins/cursor-sidecar/`
+3. Enable the plugin → **Attach**
+
+Bundled helper: `bin/cursor-sidecar.exe`
+
+Writable runtime files live in `%LOCALAPPDATA%\CursorSidecar\`
+(`config.json`, daemon token/meta/pid, state).
 
 ## Interaction
 
@@ -13,75 +24,55 @@ Open    → current Obsidian note opens in bound Cursor Desktop Editor
 Detach  → restore exact bound windows to Attach-time placements
 ```
 
-## Context Bridge
-
-While Sidecar is **attached**:
-
-```text
-Obsidian current note (+ line/column)
-        ↓
-Open in real Cursor Desktop Editor
-```
-
-- Uses the **bound** Cursor PID → real `Cursor.exe` (not a hardcoded path)
-- Prefers Desktop Editor flags: `--classic --reuse-window --goto`
-- Falls back to `cursor://file/...` deep link
-- **Does not use Cursor Agent CLI / ACP / `agent`**
-
-Must Attach first (`sidecar_not_attached` otherwise).
-
-Multi-Cursor routing relies on focusing the bound editor before
-`--reuse-window` invocation because Cursor does not expose a public
-HWND-targeting argument. If a new Cursor window appears, Sidecar binding
-is unchanged and a `routing_warning` is returned.
-
-## Width presets
-
-| Preset  | Obsidian | Cursor |
-|---------|----------|--------|
-| Compact | 78%      | 22%    |
-| Normal  | 70%      | 30%    |
-| Wide    | 58%      | 42%    |
-
-## Live Sidecar (daemon)
-
-Authenticated localhost daemon (`X-Cursor-Sidecar-Token`).
-
-Obsidian **Live Sidecar** toggle maps to `set-live-follow` (stops Hook without Detach).
-
-## Commands
+## Developer / source mode
 
 ```powershell
+cd cursor-sidecar
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements-dev.txt
 python main.py attach
-python main.py detach
-python main.py open-editor-file --vault-root <vault> --path <file> --line 10 --column 1
-python main.py open-editor-vault --path <vault>
-python main.py status --json
+pytest -q
 ```
 
-## Tests
+Optional isolated data dir:
 
 ```powershell
-pytest
-python -m py_compile main.py window.py geometry.py win_events.py editor_bridge.py acceptance_run.py acceptance_live_follow.py acceptance_context_bridge.py
+python main.py --data-dir D:\tmp\sidecar-data status --json
+```
+
+## Build packaged helper (Windows x64)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+```
+
+Outputs:
+
+- `dist/cursor-sidecar.exe`
+- `release/cursor-sidecar/` (plugin layout + `bin/`)
+- `release/cursor-sidecar-v0.5.0-windows-x64.zip`
+
+## Packaged acceptance
+
+```powershell
+python acceptance_packaged.py
+# or after UI is available:
+python acceptance_packaged.py   # full
+python acceptance_packaged.py --skip-ui
+```
+
+## Tests / static checks
+
+```powershell
+pytest -q
+python -m py_compile main.py runtime_paths.py window.py geometry.py win_events.py editor_bridge.py acceptance_run.py acceptance_live_follow.py acceptance_context_bridge.py acceptance_packaged.py
 node --check ../obsidian-plugin/main.js
-```
-
-## Acceptance testing
-
-```powershell
-python acceptance_run.py
-python acceptance_live_follow.py
-python acceptance_context_bridge.py
 ```
 
 ## Remaining limitations
 
-- When no usable space remains to the right of Obsidian, follow placement is constrained by the monitor work area.
-- Context Bridge cannot 100% force a specific HWND; it focuses the bound window then uses `--reuse-window`.
-- Detached “Open in Cursor” is intentionally unsupported in v0.4.x.
-- Advanced daemon host/port changes are migrated automatically on next `ensureDaemon()` / `daemon-start` (v0.4.1).
-
-## Out of scope
-
-Agent prompt / selection→Agent / bidirectional cursor sync / PyInstaller / SetParent / embedding
+- Windows x64 only (no macOS / Linux / ARM64 in v0.5)
+- Helper binary is **unsigned** (SmartScreen / unknown publisher possible)
+- No code signing, auto-update, or Community Plugin store listing yet
+- When no usable space remains to the right of Obsidian, follow placement is constrained by the monitor work area
+- Multi-Cursor routing relies on focusing the bound editor before `--reuse-window`

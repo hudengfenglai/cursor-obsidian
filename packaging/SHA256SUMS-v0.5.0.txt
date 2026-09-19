@@ -1,0 +1,2 @@
+bc70ed4442080cd1f6510e9cc5befecf73ba69b6325391a9ddbdb511df46218f  cursor-sidecar.exe
+cb7d73565746c7c80314380c05c355306aa92b37a9166d7069d3420ecbcff348  cursor-sidecar-v0.5.0-windows-x64.zip
