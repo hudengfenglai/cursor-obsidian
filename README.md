@@ -1,25 +1,22 @@
 # cursor-obsidian
 
-**v0.5.0** — Zero-config Windows packaging (bundled `cursor-sidecar.exe`).
+**v0.6.0** — Context Follow (silent active-file sync) on top of zero-config Windows packaging.
+
+Stable baseline: **v0.5.0** (`bf63d6d`).
 
 Repo: https://github.com/hudengfenglai/cursor-obsidian
 
 ## Install (Windows x64 — end users)
 
-1. Download `cursor-sidecar-v0.5.0-windows-x64.zip`
-2. Unzip into your Obsidian vault plugin folder  
-   (e.g. `<vault>/<configDir>/plugins/cursor-sidecar/`)
-3. Enable **Cursor Sidecar** in Obsidian Community Plugins / Installed plugins
-4. Click **Attach** (ribbon or command)
+1. Download the latest Windows x64 release zip
+2. Unzip into your Obsidian vault plugin folder
+3. Enable **Cursor Sidecar** → **Attach**
+4. Optionally enable **Context Follow** (keeps Cursor on the active note without stealing focus)
 
-No Python, pip, venv, or pywin32 install required.
+No Python, pip, or venv required for packaged installs.
 
-> **Note:** The helper binary is currently **unsigned**. Windows SmartScreen may warn about an unknown publisher. This is expected for v0.5; do not bypass security software — acknowledge the publisher warning if you trust the release source.
+> Helper binary may be unsigned (SmartScreen). This is a sidecar / desktop integration, not native embedded Cursor.
 
-## Developer setup (source mode)
+## Developer setup
 
-See `cursor-sidecar/README.md`. Source mode (`python main.py …`) remains fully supported for development, pytest, and acceptance scripts.
-
-## Scope
-
-Live Sidecar + Context Bridge. No Cursor Agent CLI / ACP / API. Cursor remains the real Desktop Editor.
+See `cursor-sidecar/README.md`.

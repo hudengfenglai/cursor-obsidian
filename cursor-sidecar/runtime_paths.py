@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 DEFAULT_CONFIG_VALUES: dict[str, Any] = {
     "preset": "normal",

@@ -1,8 +1,10 @@
-# Cursor Sidecar v0.5.0 — Zero-config Packaging
+# Cursor Sidecar v0.6.0 — Context Follow
 
 Dock the **real Cursor Desktop** beside Obsidian on Windows, keep Cursor
-stuck to Obsidian’s right edge while attached, and open the current note
-in that same bound Editor — **without installing Python**.
+stuck to Obsidian’s right edge while attached, and optionally keep Cursor
+on the **active Obsidian file** without stealing focus.
+
+Stable packaged baseline remains v0.5.0; this tree is **0.6.0-dev** until tagged.
 
 ## End-user install
 
@@ -20,9 +22,18 @@ Writable runtime files live in `%LOCALAPPDATA%\CursorSidecar\`
 ```text
 Attach  → initial split by preset (default Normal = 70/30)
 Then    → Cursor follows Obsidian live via WinEventHook
-Open    → current Obsidian note opens in bound Cursor Desktop Editor
+Follow  → (optional) Cursor file follows Obsidian active note — silent
+Open    → explicit command opens note and focuses Cursor
 Detach  → restore exact bound windows to Attach-time placements
 ```
+
+## Context Follow
+
+Settings → **Context Follow** (default OFF).
+
+When Sidecar is **attached** and Context Follow is on, Obsidian `file-open`
+events debounce (~150ms) and call `sync-editor-file` (`focus=false`).
+Manual **Open current note in Cursor** still uses `open-editor-file` with focus.
 
 ## Developer / source mode
 
@@ -56,8 +67,6 @@ Outputs:
 
 ```powershell
 python acceptance_packaged.py
-# or after UI is available:
-python acceptance_packaged.py   # full
 python acceptance_packaged.py --skip-ui
 ```
 
@@ -65,14 +74,16 @@ python acceptance_packaged.py --skip-ui
 
 ```powershell
 pytest -q
-python -m py_compile main.py runtime_paths.py window.py geometry.py win_events.py editor_bridge.py acceptance_run.py acceptance_live_follow.py acceptance_context_bridge.py acceptance_packaged.py
+python -m py_compile main.py runtime_paths.py context_follow.py window.py geometry.py win_events.py editor_bridge.py acceptance_run.py acceptance_live_follow.py acceptance_context_bridge.py acceptance_context_follow.py acceptance_packaged.py
 node --check ../obsidian-plugin/main.js
+python acceptance_context_follow.py
 ```
 
 ## Remaining limitations
 
-- Windows x64 only (no macOS / Linux / ARM64 in v0.5)
+- Windows x64 only (no macOS / Linux / ARM64)
 - Helper binary is **unsigned** (SmartScreen / unknown publisher possible)
 - No code signing, auto-update, or Community Plugin store listing yet
+- Context Follow cannot guarantee Cursor never activates; focus is restored to Obsidian when stolen
 - When no usable space remains to the right of Obsidian, follow placement is constrained by the monitor work area
-- Multi-Cursor routing relies on focusing the bound editor before `--reuse-window`
+- Multi-Cursor routing relies on focusing the bound editor before `--reuse-window` (explicit open only)

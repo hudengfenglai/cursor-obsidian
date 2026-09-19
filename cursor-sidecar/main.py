@@ -29,6 +29,7 @@ from geometry import (
     recover_state_dict,
     resolve_preset,
 )
+from context_follow import ContextFollowGate, is_excluded_rel_path, is_path_inside_vault
 from runtime_paths import (
     DEFAULT_CONFIG_VALUES,
     VERSION,
@@ -45,12 +46,14 @@ from window import (
     find_cursor_window,
     find_obsidian_window,
     focus_window,
+    get_foreground_hwnd,
     get_work_area_for_hwnd,
     get_window_rect,
     is_process_running,
     launch_process,
     resolve_bound_window,
     resolve_cursor_exe,
+    restore_foreground_if_stolen,
     snapshot_window,
     toggle_cursor_visibility,
     validate_window_binding,
@@ -76,6 +79,7 @@ _FOLLOW: LiveFollowService | None = None
 _DAEMON_MODE = False
 _STOP_DAEMON = threading.Event()
 _DAEMON_HTTP_SERVER: ThreadingHTTPServer | None = None
+_CONTEXT_FOLLOW_GATE = ContextFollowGate()
 
 LOCALHOST_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -1002,6 +1006,9 @@ def open_editor_file_result(
         line=line,
         column=column,
         focus=bool(focus),
+        preserve_foreground=False if focus else True,
+        get_foreground_hwnd=get_foreground_hwnd,
+        restore_if_stolen=restore_foreground_if_stolen,
     )
     # Guarantee Sidecar lifecycle fields untouched
     state_after = read_state()
@@ -1010,6 +1017,83 @@ def open_editor_file_result(
             result["state_mutation_warning"] = key
             break
     result["cmd"] = "open-editor-file"
+    return result
+
+
+def sync_editor_file_result(
+    cfg: dict[str, Any],
+    *,
+    vault_root: str | None,
+    path: str | None,
+    line: int | None = None,
+    column: int | None = None,
+    relative_path: str | None = None,
+) -> dict[str, Any]:
+    """Context Follow: silent open in bound Cursor. Always focus=False; never auto-attach."""
+    truth = refresh_attachment_truth()
+    if not truth["attached"]:
+        return {
+            "ok": False,
+            "error": "sidecar_not_attached",
+            "message": "Attach Cursor Sidecar first.",
+            "cmd": "sync-editor-file",
+        }
+    if not path:
+        return {"ok": False, "error": "path_required", "cmd": "sync-editor-file"}
+    if not vault_root:
+        return {"ok": False, "error": "vault_root_required", "cmd": "sync-editor-file"}
+
+    # Exclude vault config / hidden system paths
+    rel = relative_path
+    if not rel:
+        try:
+            rel = str(Path(path).resolve().relative_to(Path(vault_root).resolve())).replace("\\", "/")
+        except Exception:
+            rel = None
+    if rel and is_excluded_rel_path(rel):
+        return {"ok": False, "error": "path_excluded", "cmd": "sync-editor-file", "path": rel}
+    if not is_path_inside_vault(vault_root, path):
+        return {"ok": False, "error": "path_outside_vault", "cmd": "sync-editor-file"}
+
+    state_before = read_state()
+    binding = dict(state_before.get("cursor") or {})
+    # Exact bound Cursor only — never rediscover
+    if not validate_window_binding(binding).get("ok"):
+        return {
+            "ok": False,
+            "error": "stale_binding",
+            "message": "Bound Cursor gone; Context Follow idle.",
+            "cmd": "sync-editor-file",
+        }
+
+    result = _editor_bridge(cfg).open_file(
+        binding=binding,
+        vault_root=vault_root,
+        path=path,
+        line=line,
+        column=column,
+        focus=False,
+        preserve_foreground=True,
+        get_foreground_hwnd=get_foreground_hwnd,
+        restore_if_stolen=restore_foreground_if_stolen,
+    )
+    state_after = read_state()
+    for key in ("attached", "preset", "obsidian", "cursor", "left_rect", "right_rect"):
+        if state_before.get(key) != state_after.get(key):
+            result["state_mutation_warning"] = key
+            break
+    result["cmd"] = "sync-editor-file"
+    result["focused"] = False
+    if result.get("ok"):
+        _CONTEXT_FOLLOW_GATE.record(
+            str(result.get("path") or path),
+            result.get("line") if line is not None else None,
+            relative_path=rel,
+        )
+    result["context_follow"] = {
+        "last_path": _CONTEXT_FOLLOW_GATE.last_relative_path or _CONTEXT_FOLLOW_GATE.last_path,
+        "last_sync_at": _CONTEXT_FOLLOW_GATE.last_sync_at or None,
+    }
     return result
 
 
@@ -1063,6 +1147,28 @@ def cmd_open_editor_file(
         line=line,
         column=column,
         focus=focus,
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_sync_editor_file(
+    cfg: dict[str, Any],
+    *,
+    vault_root: str | None = None,
+    path: str | None = None,
+    line: int | None = None,
+    column: int | None = None,
+    relative_path: str | None = None,
+    **_: Any,
+) -> int:
+    result = sync_editor_file_result(
+        cfg,
+        vault_root=vault_root,
+        path=path,
+        line=line,
+        column=column,
+        relative_path=relative_path,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("ok") else 1
@@ -1185,6 +1291,10 @@ def build_status(cfg: dict[str, Any]) -> dict[str, Any]:
                 "last_follow_at": None,
             }
         ),
+        "context_follow": {
+            "last_path": _CONTEXT_FOLLOW_GATE.last_relative_path or _CONTEXT_FOLLOW_GATE.last_path,
+            "last_sync_at": _CONTEXT_FOLLOW_GATE.last_sync_at or None,
+        },
         "obsidian_binding": {
             "ok": obs_live,
             "legacy_binding": bool(obs_rep.get("legacy_binding")),
@@ -1303,6 +1413,18 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
                 line=int(line) if line is not None else None,
                 column=int(column) if column is not None else None,
                 focus=bool(body.get("focus", True)),
+            )
+        elif cmd in ("sync-editor-file", "sync_editor_file"):
+            line = body.get("line")
+            column = body.get("column")
+            # Always silent — ignore any client focus=true
+            return sync_editor_file_result(
+                cfg,
+                vault_root=body.get("vault_root") or workspace,
+                path=body.get("path") or file_path,
+                line=int(line) if line is not None else None,
+                column=int(column) if column is not None else None,
+                relative_path=body.get("relative_path") or body.get("rel_path"),
             )
         elif cmd in ("open-editor-vault", "open_editor_vault"):
             return open_editor_vault_result(
@@ -1564,6 +1686,12 @@ def build_parser() -> argparse.ArgumentParser:
     oef.add_argument("--line", type=int, default=None)
     oef.add_argument("--column", type=int, default=None)
     oef.add_argument("--no-focus", action="store_true")
+    sef = sub.add_parser("sync-editor-file", help="Context Follow: silent open (never steals focus intentionally)")
+    sef.add_argument("--path", required=True)
+    sef.add_argument("--vault-root", required=True)
+    sef.add_argument("--line", type=int, default=None)
+    sef.add_argument("--column", type=int, default=None)
+    sef.add_argument("--relative-path", default=None)
     oev = sub.add_parser("open-editor-vault", help="Context Bridge: open vault folder in bound Cursor Editor")
     oev.add_argument("--path", required=True)
     oev.add_argument("--no-focus", action="store_true")
@@ -1632,6 +1760,15 @@ def main(argv: list[str] | None = None) -> int:
             line=getattr(args, "line", None),
             column=getattr(args, "column", None),
             focus=not bool(getattr(args, "no_focus", False)),
+        )
+    if command == "sync-editor-file":
+        return cmd_sync_editor_file(
+            cfg,
+            vault_root=getattr(args, "vault_root", None),
+            path=getattr(args, "path", None),
+            line=getattr(args, "line", None),
+            column=getattr(args, "column", None),
+            relative_path=getattr(args, "relative_path", None),
         )
     if command == "open-editor-vault":
         return cmd_open_editor_vault(

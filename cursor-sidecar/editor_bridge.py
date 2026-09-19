@@ -355,6 +355,9 @@ class EditorBridge:
         line: int | None = None,
         column: int | None = None,
         focus: bool = True,
+        preserve_foreground: bool | None = None,
+        get_foreground_hwnd: Optional[Callable[[], int]] = None,
+        restore_if_stolen: Optional[Callable[[int], dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         resolved = get_bound_cursor_executable(binding, validate_fn=self.validate_binding)
         if not resolved.get("ok"):
@@ -369,6 +372,15 @@ class EditorBridge:
 
         line_i = max(int(line), 1) if line is not None else None
         col_i = max(int(column), 1) if column is not None else None
+
+        # Explicit open focuses Cursor; silent sync never focuses and may restore Obsidian.
+        do_preserve = (not focus) if preserve_foreground is None else bool(preserve_foreground)
+        fg_before = 0
+        if do_preserve and get_foreground_hwnd is not None:
+            try:
+                fg_before = int(get_foreground_hwnd() or 0)
+            except Exception:
+                fg_before = 0
 
         before = self.list_cursor_hwnds(self.process_name)
         hwnd = int(resolved["hwnd"])
@@ -390,6 +402,14 @@ class EditorBridge:
         after = self.list_cursor_hwnds(self.process_name)
         new_hwnds = detect_new_cursor_windows(before, after)
 
+        focus_meta: dict[str, Any] = {}
+        if do_preserve and fg_before and restore_if_stolen is not None:
+            try:
+                focus_meta = dict(restore_if_stolen(fg_before) or {})
+            except Exception as exc:  # noqa: BLE001
+                log.info("foreground restore failed: %s", exc)
+                focus_meta = {"stolen": True, "restored": False, "error": str(exc)}
+
         out: dict[str, Any] = {
             "ok": bool(result.get("ok")),
             "method": result.get("method"),
@@ -399,7 +419,12 @@ class EditorBridge:
             "cursor_exe": resolved["exe"],
             "bound_hwnd": hwnd,
             "bound_pid": resolved["pid"],
+            "focused": bool(focus),
         }
+        if focus_meta:
+            out["focus_stolen"] = bool(focus_meta.get("stolen"))
+            out["focus_restored"] = bool(focus_meta.get("restored"))
+            out["foreground_hwnd"] = focus_meta.get("foreground_after")
         if new_hwnds:
             out["routing_warning"] = "new_cursor_window_created"
             out["new_hwnds"] = new_hwnds

@@ -19,9 +19,13 @@ const DEFAULT_SETTINGS = {
   daemonHost: "127.0.0.1",
   daemonPort: 27845,
   liveSidecar: true,
+  contextFollow: false,
   openVaultInCursor: true,
   showNotices: true,
 };
+
+const CONTEXT_FOLLOW_DEBOUNCE_MS = 150;
+const CONTEXT_FOLLOW_SUPPRESS_MS = 400;
 
 class CursorSidecarPlugin extends Plugin {
   async onload() {
@@ -135,9 +139,28 @@ class CursorSidecarPlugin extends Plugin {
     this.addSettingTab(new CursorSidecarSettingTab(this.app, this));
     // Fire-and-forget version mismatch notice (packaged only)
     this.checkHelperVersionMismatch().catch(() => {});
+
+    // Context Follow state (plugin-local; no duplicate listeners on reload)
+    this._cfTimer = null;
+    this._cfGen = 0;
+    this._cfLastPath = null;
+    this._cfLastLine = null;
+    this._cfLastSyncAt = 0;
+    this._cfLastRelative = null;
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        this.onContextFollowFileOpen(file);
+      })
+    );
   }
 
-  onunload() {}
+  onunload() {
+    if (this._cfTimer) {
+      clearTimeout(this._cfTimer);
+      this._cfTimer = null;
+    }
+    this._cfGen += 1;
+  }
 
   async saveSettings() {
     await this.saveData(this.settings);
@@ -428,6 +451,96 @@ class CursorSidecarPlugin extends Plugin {
     }
   }
 
+  isExcludedFollowPath(relPath) {
+    const raw = String(relPath || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!raw) return true;
+    const cfg = String((this.app.vault && this.app.vault.configDir) || ".obsidian").replace(/\\/g, "/");
+    const parts = raw.split("/").filter((p) => p && p !== ".");
+    if (!parts.length) return true;
+    if (parts[0] === cfg || parts[0] === ".obsidian") return true;
+    if (parts[0].startsWith(".")) return true;
+    return false;
+  }
+
+  onContextFollowFileOpen(file) {
+    if (!this.settings.contextFollow) return;
+    if (!(file instanceof TFile)) return;
+    if (this.isExcludedFollowPath(file.path)) return;
+
+    if (this._cfTimer) clearTimeout(this._cfTimer);
+    this._cfGen += 1;
+    const gen = this._cfGen;
+    const target = file;
+    this._cfTimer = setTimeout(() => {
+      this._cfTimer = null;
+      if (gen !== this._cfGen) return;
+      this.runContextFollowSync(target).catch(() => {});
+    }, CONTEXT_FOLLOW_DEBOUNCE_MS);
+  }
+
+  async runContextFollowSync(file) {
+    if (!this.settings.contextFollow) return null;
+    if (!(file instanceof TFile)) return null;
+    if (this.isExcludedFollowPath(file.path)) return null;
+    if (!this.helperConfigured()) return null;
+
+    const vaultRoot = this.vaultPath();
+    const absPath = path.join(vaultRoot, file.path);
+    const now = Date.now();
+    let line = null;
+    let column = null;
+    const isMd = file.extension === "md" || file.extension === "markdown";
+    if (isMd) {
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (view && view.file && view.file.path === file.path && view.editor) {
+        const cur = view.editor.getCursor();
+        line = cur.line + 1;
+        column = cur.ch + 1;
+      }
+    }
+
+    // Same-file suppression
+    if (
+      this._cfLastPath === absPath &&
+      this._cfLastLine === line &&
+      now - (this._cfLastSyncAt || 0) < CONTEXT_FOLLOW_SUPPRESS_MS
+    ) {
+      return null;
+    }
+
+    try {
+      const up = await this.ensureDaemon();
+      if (!up) return null;
+      // Attached-only: probe status quickly
+      const st = await this.httpJson("GET", "/status").catch(() => null);
+      const status = (st && st.status) || st || {};
+      if (!status.attached) return null;
+      if (status.cursor_binding && status.cursor_binding.ok === false) return null;
+
+      const body = {
+        cmd: "sync-editor-file",
+        vault_root: vaultRoot,
+        path: absPath,
+        relative_path: file.path,
+      };
+      if (line !== null) body.line = line;
+      if (column !== null) body.column = column;
+
+      const result = await this.httpJson("POST", "/rpc", body);
+      if (!result || result.ok === false) {
+        // Silent: attached/stale/excluded — no notice spam
+        return null;
+      }
+      this._cfLastPath = absPath;
+      this._cfLastLine = line;
+      this._cfLastSyncAt = Date.now();
+      this._cfLastRelative = file.path;
+      return result;
+    } catch (_e) {
+      return null;
+    }
+  }
+
   helperFrontArgs() {
     const dataDir = this.resolveDataDir();
     const args = [];
@@ -708,6 +821,32 @@ class CursorSidecarSettingTab extends PluginSettingTab {
           await this.plugin.applyLiveSidecarSetting(value);
         })
       );
+
+    new Setting(containerEl)
+      .setName("Context Follow")
+      .setDesc("Automatically keep Cursor on the active Obsidian file (silent; does not steal focus). Requires Attach.")
+      .addToggle((toggle) =>
+        toggle.setValue(!!this.plugin.settings.contextFollow).onChange(async (value) => {
+          this.plugin.settings.contextFollow = !!value;
+          await this.plugin.saveSettings();
+          if (!value) {
+            this.plugin._cfGen += 1;
+            if (this.plugin._cfTimer) {
+              clearTimeout(this.plugin._cfTimer);
+              this.plugin._cfTimer = null;
+            }
+          }
+          this.display();
+        })
+      );
+
+    if (this.plugin.settings.contextFollow || this.plugin._cfLastRelative) {
+      const cf = containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text: `Context Follow last: ${this.plugin._cfLastRelative || "(none)"}`,
+      });
+      void cf;
+    }
 
     new Setting(containerEl)
       .setName("Open vault in Cursor on Attach")

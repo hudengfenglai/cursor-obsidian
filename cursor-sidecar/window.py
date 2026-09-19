@@ -549,6 +549,63 @@ def focus_window(hwnd: int) -> None:
     show_window(hwnd)
 
 
+def get_foreground_hwnd() -> int:
+    try:
+        return int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def restore_foreground_hwnd(hwnd: int) -> bool:
+    """Restore focus to hwnd without ShowWindow (avoid flash). Returns True if applied."""
+    if not hwnd:
+        return False
+    try:
+        if not win32gui.IsWindow(int(hwnd)):
+            return False
+        user32.SetForegroundWindow(int(hwnd))
+        return True
+    except Exception:
+        return False
+
+
+def restore_foreground_if_stolen(
+    original_hwnd: int,
+    *,
+    settle_s: float = 0.12,
+    retries: int = 3,
+    retry_delay_s: float = 0.08,
+) -> dict[str, Any]:
+    """
+    If foreground left original_hwnd (e.g. Cursor activated), restore it.
+    Prefer avoiding steal; this is the safety net for silent Context Follow.
+    """
+    out: dict[str, Any] = {
+        "original": int(original_hwnd or 0),
+        "stolen": False,
+        "restored": False,
+        "foreground_after": 0,
+    }
+    if not original_hwnd:
+        return out
+    time.sleep(max(0.0, float(settle_s)))
+    current = get_foreground_hwnd()
+    out["foreground_after"] = current
+    if current == int(original_hwnd):
+        return out
+    out["stolen"] = True
+    for _ in range(max(1, int(retries))):
+        if restore_foreground_hwnd(int(original_hwnd)):
+            time.sleep(max(0.0, float(retry_delay_s)))
+            current = get_foreground_hwnd()
+            out["foreground_after"] = current
+            if current == int(original_hwnd):
+                out["restored"] = True
+                return out
+        time.sleep(max(0.0, float(retry_delay_s)))
+    return out
+
+
 def toggle_cursor_visibility(
     process_name: str,
     title_hint: str = "",

@@ -1,9 +1,9 @@
 {
   "id": "cursor-sidecar",
   "name": "Cursor Sidecar",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "minAppVersion": "1.5.0",
-  "description": "Zero-config Windows packaging: bundled cursor-sidecar.exe with Live Sidecar + Context Bridge (v0.5).",
+  "description": "Context Follow: silently keep Cursor on the active Obsidian file while attached (v0.6).",
   "author": "hudengfenglai",
   "authorUrl": "https://github.com/hudengfenglai/cursor-obsidian",
   "isDesktopOnly": true
