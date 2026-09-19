@@ -158,6 +158,20 @@ def refresh_attachment_truth(state: dict[str, Any] | None = None) -> dict[str, A
         state["stale_reason"] = verdict["reason"]
         state["timestamp"] = time.time()
         write_state(state)
+        return {**verdict, "state": state}
+
+    # After auto-detach, keep reporting the stale cause until next Attach
+    if (
+        not verdict["attached"]
+        and state.get("stale_reason")
+        and verdict.get("reason") == "detached"
+    ):
+        return {
+            "attached": False,
+            "state_valid": False,
+            "reason": str(state["stale_reason"]),
+            "state": state,
+        }
     return {**verdict, "state": state}
 
 
@@ -294,6 +308,7 @@ def cmd_attach(
             "cursor_hwnd": cur.hwnd,
             "cursor_pid": cur.pid,
         },
+        "stale_reason": None,
     }
     write_state(new_state)
     print(
