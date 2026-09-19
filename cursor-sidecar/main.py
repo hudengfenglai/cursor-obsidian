@@ -61,6 +61,24 @@ _FOLLOW: LiveFollowService | None = None
 _DAEMON_MODE = False
 _STOP_DAEMON = threading.Event()
 
+LOCALHOST_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def normalize_daemon_bind_host(host: str | None) -> str:
+    """Daemon must bind localhost only (never 0.0.0.0)."""
+    raw = (host or "127.0.0.1").strip()
+    key = raw.lower().strip("[]")
+    if key in ("0.0.0.0", "::", "*"):
+        raise ValueError("daemon must bind localhost only (got all-interfaces bind)")
+    if key not in LOCALHOST_BIND_HOSTS and not key.startswith("127."):
+        raise ValueError(f"daemon host must be localhost, got {host!r}")
+    return raw
+
+
+def daemon_endpoint_args(host: str, port: int) -> list[str]:
+    """CLI fragments so daemon-start and plugin probe the same endpoint."""
+    return ["--host", normalize_daemon_bind_host(host), "--port", str(int(port))]
+
 
 def load_config(path: Path) -> dict[str, Any]:
     if not path.is_file():
@@ -85,12 +103,26 @@ def load_config(path: Path) -> dict[str, Any]:
     cfg["poll_ms"] = int(cfg.get("poll_ms", 500))
     cfg["follow_obsidian"] = bool(cfg.get("follow_obsidian", False))
     cfg["launch_cursor_if_missing"] = bool(cfg.get("launch_cursor_if_missing", True))
-    cfg["daemon_host"] = str(cfg.get("daemon_host", "127.0.0.1"))
+    cfg["daemon_host"] = normalize_daemon_bind_host(str(cfg.get("daemon_host", "127.0.0.1")))
     cfg["daemon_port"] = int(cfg.get("daemon_port", 27845))
     cfg["live_follow"] = bool(cfg.get("live_follow", True))
     cfg["follow_debounce_ms"] = int(cfg.get("follow_debounce_ms", 40))
     cfg["debug"] = bool(cfg.get("debug", False))
     return cfg
+
+
+def update_config_file(updates: dict[str, Any]) -> None:
+    path = ROOT / "config.json"
+    raw: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                raw = loaded
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+    raw.update(updates)
+    atomic_write_text(path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
 
 
 def read_state() -> dict[str, Any]:
@@ -238,36 +270,63 @@ def apply_preset_to_cfg(cfg: dict[str, Any], preset: str) -> None:
     cfg["cursor_ratio"] = c
 
 
+def cmd_set_live_follow(cfg: dict[str, Any], enabled: bool, **_: Any) -> int:
+    """Enable/disable Live Follow without Detach. Persists config.json live_follow."""
+    with LIFECYCLE_LOCK:
+        cfg["live_follow"] = bool(enabled)
+        try:
+            update_config_file({"live_follow": bool(enabled)})
+        except OSError as exc:
+            print(f"[sidecar] could not persist live_follow: {exc}")
+        if not enabled:
+            stop_live_follow()
+            if _FOLLOW is not None:
+                _FOLLOW.enabled = False
+            print("[sidecar] live_follow=false (hook stopped; still attached if previously attached)")
+            return 0
+        svc = ensure_live_follow_service(cfg)
+        svc.enabled = True
+        truth = refresh_attachment_truth()
+        if truth["attached"]:
+            start_live_follow_if_daemon(cfg, truth["state"])
+            print("[sidecar] live_follow=true (follow started for attached session)")
+        else:
+            print("[sidecar] live_follow=true (will follow on next Attach)")
+        return 0
+
+
 def refresh_attachment_truth(state: dict[str, Any] | None = None) -> dict[str, Any]:
     """Recompute attached/state_valid; persist correction if stale."""
-    state = dict(state if state is not None else read_state())
-    obs = state.get("obsidian") or {}
-    cur = state.get("cursor") or {}
-    verdict = evaluate_attachment(
-        state,
-        obsidian_live=binding_live(obs),
-        cursor_live=binding_live(cur),
-    )
-    if state.get("attached") and not verdict["attached"]:
-        state["attached"] = False
-        state["stale_reason"] = verdict["reason"]
-        state["timestamp"] = time.time()
-        write_state(state)
-        return {**verdict, "state": state}
+    with LIFECYCLE_LOCK:
+        state = dict(state if state is not None else read_state())
+        obs = state.get("obsidian") or {}
+        cur = state.get("cursor") or {}
+        verdict = evaluate_attachment(
+            state,
+            obsidian_live=binding_live(obs),
+            cursor_live=binding_live(cur),
+        )
+        if state.get("attached") and not verdict["attached"]:
+            state["attached"] = False
+            state["stale_reason"] = verdict["reason"]
+            state["timestamp"] = time.time()
+            write_state(state)
+            stop_live_follow()
+            return {**verdict, "state": state}
 
-    # After auto-detach, keep reporting the stale cause until next Attach
-    if (
-        not verdict["attached"]
-        and state.get("stale_reason")
-        and verdict.get("reason") == "detached"
-    ):
-        return {
-            "attached": False,
-            "state_valid": False,
-            "reason": str(state["stale_reason"]),
-            "state": state,
-        }
-    return {**verdict, "state": state}
+        # After auto-detach, keep reporting the stale cause until next Attach
+        if (
+            not verdict["attached"]
+            and state.get("stale_reason")
+            and verdict.get("reason") == "detached"
+        ):
+            return {
+                "attached": False,
+                "state_valid": False,
+                "reason": str(state["stale_reason"]),
+                "state": state,
+            }
+        return {**verdict, "state": state}
 
 
 def ensure_cursor(
@@ -555,31 +614,25 @@ def cmd_arrange(cfg: dict[str, Any], **_: Any) -> int:
 def cmd_preset(cfg: dict[str, Any], preset: str | None = None, **_: Any) -> int:
     """Set Compact/Normal/Wide. Arrange immediately if attached."""
     name = preset or cfg.get("preset") or "normal"
-    try:
-        apply_preset_to_cfg(cfg, str(name))
-    except ValueError as exc:
-        print(f"[sidecar] {exc}")
-        return 1
-    # Persist into config file lightly via state
-    state = read_state()
-    state["preset"] = cfg["preset"]
-    state["timestamp"] = time.time()
-    write_state(state)
-    # Also write config.json preset for next daemon start
-    try:
-        raw = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-        raw["preset"] = cfg["preset"]
-        atomic_write_text(
-            ROOT / "config.json",
-            json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
-        )
-    except OSError:
-        pass
-    print(f"[sidecar] preset={cfg['preset']} ratios={cfg['obsidian_ratio']}/{cfg['cursor_ratio']}")
-    truth = refresh_attachment_truth()
-    if truth["attached"]:
-        return cmd_arrange(cfg)
-    return 0
+    with LIFECYCLE_LOCK:
+        try:
+            apply_preset_to_cfg(cfg, str(name))
+        except ValueError as exc:
+            print(f"[sidecar] {exc}")
+            return 1
+        state = read_state()
+        state["preset"] = cfg["preset"]
+        state["timestamp"] = time.time()
+        write_state(state)
+        try:
+            update_config_file({"preset": cfg["preset"]})
+        except OSError:
+            pass
+        print(f"[sidecar] preset={cfg['preset']} ratios={cfg['obsidian_ratio']}/{cfg['cursor_ratio']}")
+        truth = refresh_attachment_truth()
+        if truth["attached"]:
+            return cmd_arrange(cfg)
+        return 0
 
 
 def cmd_focus(cfg: dict[str, Any], **_: Any) -> int:
@@ -847,6 +900,10 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         elif cmd in ("preset", "compact", "normal", "wide"):
             name = preset or (cmd if cmd != "preset" else cfg.get("preset"))
             code = cmd_preset(cfg, preset=str(name))
+        elif cmd in ("set-live-follow", "set_live_follow", "live-follow"):
+            if "enabled" not in body:
+                return {"ok": False, "error": "enabled required"}
+            code = cmd_set_live_follow(cfg, enabled=bool(body.get("enabled")))
         elif cmd == "toggle":
             code = cmd_toggle(cfg)
         elif cmd == "show":
@@ -988,11 +1045,20 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
             return 0
         except OSError:
             clear_pid(DAEMON_PID_FILE)
+    host = normalize_daemon_bind_host(str(cfg["daemon_host"]))
+    port = int(cfg["daemon_port"])
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
     subprocess.Popen(
-        [sys.executable, str(ROOT / "main.py"), "-c", str(DEFAULT_CONFIG), "daemon"],
+        [
+            sys.executable,
+            str(ROOT / "main.py"),
+            "-c",
+            str(DEFAULT_CONFIG),
+            "daemon",
+            *daemon_endpoint_args(host, port),
+        ],
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -1000,7 +1066,7 @@ def cmd_daemon_start(cfg: dict[str, Any], **_: Any) -> int:
         close_fds=True,
     )
     time.sleep(0.5)
-    print(f"[sidecar] daemon-start port={cfg['daemon_port']} (auth token file ready)")
+    print(f"[sidecar] daemon-start http://{host}:{port} (auth token file ready)")
     return 0
 
 
@@ -1020,6 +1086,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("compact", help="preset compact")
     sub.add_parser("normal", help="preset normal")
     sub.add_parser("wide", help="preset wide")
+    live_p = sub.add_parser("set-live-follow", help="Enable/disable Live Follow without Detach")
+    live_p.add_argument("--enabled", choices=("true", "false", "1", "0", "on", "off"), required=True)
     sub.add_parser("focus", help="Focus bound Cursor window")
     sub.add_parser("toggle", help="Show/hide Cursor (advanced)")
     sub.add_parser("show", help="Show Cursor")
@@ -1028,8 +1096,12 @@ def build_parser() -> argparse.ArgumentParser:
     status_p = sub.add_parser("status", help="Attachment + window status")
     status_p.add_argument("--json", action="store_true")
     sub.add_parser("stop", help="Stop follow/daemon pids")
-    sub.add_parser("daemon", help="Foreground daemon (HTTP + Live Follow)")
-    sub.add_parser("daemon-start", help="Background daemon")
+    daemon_p = sub.add_parser("daemon", help="Foreground daemon (HTTP + Live Follow)")
+    daemon_p.add_argument("--host", default=None, help="Bind host (localhost only)")
+    daemon_p.add_argument("--port", type=int, default=None)
+    daemon_start_p = sub.add_parser("daemon-start", help="Background daemon")
+    daemon_start_p.add_argument("--host", default=None, help="Bind host (localhost only)")
+    daemon_start_p.add_argument("--port", type=int, default=None)
 
     sub.add_parser("dock", help="alias of attach")
     sub.add_parser("undock", help="alias of detach")
@@ -1044,6 +1116,12 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(Path(args.config))
     common = {"workspace": args.workspace, "file_path": args.file}
 
+    # Apply CLI host/port overrides before daemon commands (same endpoint as plugin)
+    if getattr(args, "host", None):
+        cfg["daemon_host"] = normalize_daemon_bind_host(str(args.host))
+    if getattr(args, "port", None) is not None:
+        cfg["daemon_port"] = int(args.port)
+
     aliases = {"dock": "attach", "undock": "detach", "restore": "detach"}
     command = aliases.get(args.command, args.command)
 
@@ -1054,6 +1132,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_preset(cfg, preset=command, **common)
     if command == "preset":
         return cmd_preset(cfg, preset=getattr(args, "name", None) or "normal", **common)
+    if command == "set-live-follow":
+        flag = str(getattr(args, "enabled", "true")).lower()
+        enabled = flag in ("true", "1", "on", "yes")
+        return cmd_set_live_follow(cfg, enabled=enabled, **common)
 
     dispatch = {
         "attach": cmd_attach,

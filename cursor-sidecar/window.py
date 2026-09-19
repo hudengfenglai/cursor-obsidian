@@ -330,17 +330,19 @@ def get_work_area_for_hwnd(hwnd: int) -> Rect:
     return Rect(work[0], work[1], work[2], work[3])
 
 
-def get_monitor_work_area(monitor_index: int = 0) -> Rect:
-    """Advanced: fixed monitor index (enumeration order). Prefer get_work_area_for_hwnd."""
+def list_monitor_work_areas() -> list[Rect]:
+    """All monitor work areas (enumeration order). Supports negative coordinates."""
     monitors: list[Rect] = []
-
-    def _enum(hmonitor: int, _hdc: int, _lprect: object, _data: object) -> int:
+    for hmonitor, _hdc, _rect in win32api.EnumDisplayMonitors(None, None):
         info = win32api.GetMonitorInfo(hmonitor)
         work = info["Work"]
         monitors.append(Rect(work[0], work[1], work[2], work[3]))
-        return 1
+    return monitors
 
-    win32api.EnumDisplayMonitors(None, None, _enum, None)
+
+def get_monitor_work_area(monitor_index: int = 0) -> Rect:
+    """Advanced: fixed monitor index (enumeration order). Prefer get_work_area_for_hwnd."""
+    monitors = list_monitor_work_areas()
     if not monitors:
         w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)

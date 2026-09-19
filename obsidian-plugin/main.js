@@ -153,9 +153,11 @@ class CursorSidecarPlugin extends Plugin {
   async ensureDaemon() {
     if (await this.daemonHealthy()) return true;
     if (!this.pathsConfigured()) return false;
+    const host = this.settings.daemonHost || "127.0.0.1";
+    const port = String(Number(this.settings.daemonPort) || 27845);
     await this.spawnAsync(
       this.resolvePython(),
-      [this.resolveMainPy(), "daemon-start"],
+      [this.resolveMainPy(), "daemon-start", "--host", host, "--port", port],
       this.settings.sidecarDir
     );
     for (let i = 0; i < 15; i++) {
@@ -163,6 +165,52 @@ class CursorSidecarPlugin extends Plugin {
       if (await this.daemonHealthy()) return true;
     }
     return false;
+  }
+
+  async applyLiveSidecarSetting(enabled) {
+    this.settings.liveSidecar = !!enabled;
+    await this.saveSettings();
+    try {
+      if (enabled) {
+        const up = await this.ensureDaemon();
+        if (!up) {
+          this.notify("Cursor Sidecar: could not start daemon for Live Sidecar", true);
+          return;
+        }
+        const result = await this.httpJson("POST", "/rpc", {
+          cmd: "set-live-follow",
+          enabled: true,
+        });
+        if (!result || result.ok === false) {
+          this.notify(
+            `Cursor Sidecar: set-live-follow failed: ${String(
+              (result && result.error) || "rpc failed"
+            ).slice(0, 200)}`,
+            true
+          );
+          return;
+        }
+        this.notify("Live Sidecar ON");
+      } else if (await this.daemonHealthy()) {
+        const result = await this.httpJson("POST", "/rpc", {
+          cmd: "set-live-follow",
+          enabled: false,
+        });
+        if (!result || result.ok === false) {
+          this.notify(
+            `Cursor Sidecar: set-live-follow failed: ${String(
+              (result && result.error) || "rpc failed"
+            ).slice(0, 200)}`,
+            true
+          );
+          return;
+        }
+        this.notify("Live Sidecar OFF (windows stay; follow stopped)");
+      }
+      // OFF + daemon down: nothing to stop
+    } catch (err) {
+      this.notify(`Live Sidecar toggle error: ${err.message || err}`, true);
+    }
   }
 
   daemonHealthy() {
@@ -361,11 +409,10 @@ class CursorSidecarSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Live Sidecar")
-      .setDesc("When enabled, Cursor follows Obsidian while attached.")
+      .setDesc("When enabled, Cursor follows Obsidian while attached. Off keeps the layout but stops live follow.")
       .addToggle((toggle) =>
         toggle.setValue(!!this.plugin.settings.liveSidecar).onChange(async (value) => {
-          this.plugin.settings.liveSidecar = value;
-          await this.plugin.saveSettings();
+          await this.plugin.applyLiveSidecarSetting(value);
         })
       );
 

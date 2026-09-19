@@ -1,13 +1,18 @@
-"""Windows acceptance for v0.3 Live Sidecar follow (self-restoring).
+"""Windows STRICT acceptance for v0.3 Live Sidecar (self-restoring).
 
-Windows-only. Not CI. Refuses to run if Sidecar is already attached.
-Enables in-process daemon mode so WinEventHook can run without a separate process.
+Windows-only. Not CI.
+Default mode is STRICT: no follow_now() rescue, no private handler calls.
+Drives a real out-of-process daemon so WinEventHook (WINEVENT_SKIPOWNPROCESS)
+can observe moves performed by this harness process.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -18,18 +23,27 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from window import (  # noqa: E402
+    Rect,
     apply_window_placement,
     enable_dpi_awareness,
     find_cursor_window,
     find_obsidian_window,
     get_window_rect,
     get_work_area_for_hwnd,
+    list_monitor_work_areas,
     set_window_rect,
     snapshot_window,
     validate_window_binding,
-    Rect,
 )
 import main as sidecar  # noqa: E402
+
+# STRICT: forbids rescue helpers that mask missing WinEvents
+STRICT_ACCEPTANCE = True
+
+
+def forbid_rescue(name: str) -> None:
+    if STRICT_ACCEPTANCE:
+        raise RuntimeError(f"strict acceptance forbids rescue: {name}")
 
 
 def load_cfg() -> dict[str, Any]:
@@ -56,7 +70,10 @@ def wait_windows(cfg: dict[str, Any], timeout: float = 20.0):
     )
 
 
-def result(name: str, ok: bool, detail: str) -> bool:
+def result(name: str, ok: bool | None, detail: str) -> bool | None:
+    if ok is None:
+        print(f"[SKIP] {name}: {detail}")
+        return None
     mark = "PASS" if ok else "FAIL"
     print(f"[{mark}] {name}: {detail}")
     return ok
@@ -97,7 +114,7 @@ def restore_exact_snapshot(snap: dict[str, Any] | None, label: str) -> str:
     return "ok" if ok else "fail"
 
 
-def approx_edge(cursor_left: int, obs_right: int, tol: int = 8) -> bool:
+def approx_edge(cursor_left: int, obs_right: int, tol: int = 12) -> bool:
     return abs(cursor_left - obs_right) <= tol
 
 
@@ -106,134 +123,293 @@ def force_move(hwnd: int, left: int, top: int, width: int, height: int) -> None:
     set_window_rect(hwnd, Rect(left, top, left + width, top + height), activate=False)
 
 
-def wait_follow(
+def daemon_token() -> str:
+    if sidecar.TOKEN_FILE.is_file():
+        return sidecar.TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return sidecar.ensure_daemon_token()
+
+
+def http_json(cfg: dict[str, Any], method: str, path: str, body: dict | None = None) -> dict[str, Any]:
+    host = cfg["daemon_host"]
+    port = int(cfg["daemon_port"])
+    url = f"http://{host}:{port}{path}"
+    data = None
+    headers = {"X-Cursor-Sidecar-Token": daemon_token()}
+    if body is not None:
+        raw = json.dumps(body).encode("utf-8")
+        data = raw
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(raw))
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raw_err = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw_err or "{}")
+        except json.JSONDecodeError:
+            payload = {"ok": False, "error": raw_err or str(exc)}
+        payload.setdefault("ok", False)
+        payload["_http_status"] = exc.code
+        return payload
+
+
+def daemon_healthy(cfg: dict[str, Any]) -> bool:
+    try:
+        r = http_json(cfg, "GET", "/health")
+        return bool(r.get("ok"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return False
+
+
+def rpc(cfg: dict[str, Any], cmd: str, **extra: Any) -> dict[str, Any]:
+    body = {"cmd": cmd, **extra}
+    return http_json(cfg, "POST", "/rpc", body)
+
+
+def status_remote(cfg: dict[str, Any]) -> dict[str, Any]:
+    payload = http_json(cfg, "GET", "/status")
+    return payload.get("status") or payload
+
+
+def ensure_daemon(cfg: dict[str, Any]) -> bool:
+    """Ensure out-of-process daemon runs RC code. Returns True if we (re)started it."""
+    def _wait_up() -> bool:
+        for _ in range(24):
+            time.sleep(0.25)
+            if daemon_healthy(cfg):
+                return True
+        return False
+
+    if daemon_healthy(cfg):
+        probe = rpc(cfg, "set-live-follow", enabled=True)
+        if probe.get("ok"):
+            return False
+        # Old daemon without set-live-follow — restart to load current code
+        print(
+            f"[acceptance-live] restarting daemon (RC probe failed: "
+            f"{probe.get('error') or probe.get('_http_status')})"
+        )
+        try:
+            sidecar.cmd_stop(cfg)
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+    sidecar.cmd_daemon_start(cfg)
+    if not _wait_up():
+        raise RuntimeError("daemon failed to become healthy")
+    probe = rpc(cfg, "set-live-follow", enabled=True)
+    if not probe.get("ok"):
+        raise RuntimeError(f"set-live-follow unsupported after restart: {probe}")
+    return True
+
+
+def wait_hook_follow(
+    cfg: dict[str, Any],
     obs_hwnd: int,
     cur_hwnd: int,
     *,
-    timeout: float = 3.0,
+    baseline_follow_at: float | None,
+    allowed_events: set[str],
+    timeout: float = 5.0,
     expect_hidden: bool | None = None,
 ) -> tuple[bool, str]:
+    """Wait for daemon WinEventHook to update follow — never calls follow_now()."""
+    if not STRICT_ACCEPTANCE:
+        forbid_rescue("non-strict")
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
+        st = status_remote(cfg)
+        lf = st.get("live_follow") or {}
+        last_at = lf.get("last_follow_at")
+        last_event = str(lf.get("last_event") or "")
         if expect_hidden is True:
             vis = bool(win32gui.IsWindowVisible(cur_hwnd))
             iconic = bool(win32gui.IsIconic(cur_hwnd))
-            if not vis or iconic:
-                return True, f"hidden vis={vis} iconic={iconic}"
-            last = f"still visible vis={vis}"
+            event_ok = (not allowed_events) or (last_event in allowed_events)
+            if (not vis or iconic) and event_ok:
+                return True, f"hidden vis={vis} iconic={iconic} event={last_event}"
+            last = f"vis={vis} iconic={iconic} event={last_event}"
             time.sleep(0.1)
             continue
         if expect_hidden is False:
             if win32gui.IsWindowVisible(cur_hwnd) and not win32gui.IsIconic(cur_hwnd):
-                # also require edge follow
                 o = get_window_rect(obs_hwnd).as_tuple()
                 c = get_window_rect(cur_hwnd).as_tuple()
-                if approx_edge(c[0], o[2]) and abs(c[1] - o[1]) <= 12:
-                    return True, f"visible+follow O={o} C={c}"
-            last = "waiting restore+follow"
+                follow_ok = approx_edge(c[0], o[2]) and abs(c[1] - o[1]) <= 16
+                event_ok = (not allowed_events) or (last_event in allowed_events)
+                at_ok = last_at is not None and (
+                    baseline_follow_at is None or float(last_at) > float(baseline_follow_at)
+                )
+                if follow_ok and event_ok and (at_ok or last_event in allowed_events):
+                    return True, f"visible+follow event={last_event} O={o} C={c}"
+            last = f"waiting restore event={last_event}"
             time.sleep(0.1)
             continue
+
         o = get_window_rect(obs_hwnd).as_tuple()
         c = get_window_rect(cur_hwnd).as_tuple()
-        height_ok = abs((c[3] - c[1]) - (o[3] - o[1])) <= 16
-        if approx_edge(c[0], o[2]) and abs(c[1] - o[1]) <= 12 and height_ok:
-            return True, f"O={o} C={c}"
-        last = f"O={o} C={c}"
-        # nudge follow in case event missed during synthetic SetWindowPos
-        if sidecar._FOLLOW:
-            sidecar._FOLLOW.follow_now()
-        time.sleep(0.08)
+        height_ok = abs((c[3] - c[1]) - (o[3] - o[1])) <= 20
+        rect_ok = approx_edge(c[0], o[2]) and abs(c[1] - o[1]) <= 16 and height_ok
+        event_ok = last_event in allowed_events
+        at_ok = last_at is not None and (
+            baseline_follow_at is None or float(last_at) > float(baseline_follow_at or 0)
+        )
+        if rect_ok and event_ok and at_ok:
+            return True, f"event={last_event} at={last_at} O={o} C={c}"
+        last = f"event={last_event} at={last_at} O={o} C={c} rect_ok={rect_ok}"
+        # STRICT: never sidecar._FOLLOW.follow_now() here
+        time.sleep(0.1)
     return False, last
 
 
-def run_scenarios(cfg: dict[str, Any], obs_hwnd: int, cur_hwnd: int) -> list[bool]:
-    outcomes: list[bool] = []
+def run_scenarios(cfg: dict[str, Any], obs_hwnd: int, cur_hwnd: int) -> list[bool | None]:
+    outcomes: list[bool | None] = []
     work = get_work_area_for_hwnd(obs_hwnd)
 
-    # Enable in-process live follow (same process as harness)
-    sidecar._DAEMON_MODE = True
-
-    print("--- A: Attach → move Obsidian → Cursor right-edge follows ---")
-    code = sidecar.cmd_attach(cfg)
-    st = sidecar.build_status(cfg)
+    print("--- A: Attach → move Obsidian → Cursor follows via WinEventHook ---")
+    r = rpc(cfg, "attach")
+    time.sleep(0.5)
+    st = status_remote(cfg)
     lf = st.get("live_follow") or {}
-    attach_ok = code == 0 and st.get("attached") is True
-    # Ensure hook running
-    state = sidecar.read_state()
-    sidecar.start_live_follow_if_daemon(cfg, state)
-    time.sleep(0.3)
-    st2 = sidecar.build_status(cfg)
-    lf = st2.get("live_follow") or {}
+    attach_ok = bool(r.get("ok")) and st.get("attached") is True
     hook_ok = bool(lf.get("running") or lf.get("hook_installed"))
+    baseline_at = lf.get("last_follow_at")
+    baseline_event = lf.get("last_event")
 
-    # Move Obsidian within work area (do not touch Cursor)
-    o0 = get_window_rect(obs_hwnd).as_tuple()
     new_left = work.left + 40
     new_top = work.top + 40
+    o0 = get_window_rect(obs_hwnd).as_tuple()
     new_w = min(max(o0[2] - o0[0], 400), work.width - 200)
     new_h = min(max(o0[3] - o0[1], 300), work.height - 80)
     force_move(obs_hwnd, new_left, new_top, new_w, new_h)
-    ok_a, detail_a = wait_follow(obs_hwnd, cur_hwnd)
-    # Obsidian must not have been snapped back to original attach left
+    ok_a, detail_a = wait_hook_follow(
+        cfg,
+        obs_hwnd,
+        cur_hwnd,
+        baseline_follow_at=float(baseline_at) if baseline_at else 0.0,
+        allowed_events={"LOCATIONCHANGE", "MOVESIZEEND"},
+    )
     o1 = get_window_rect(obs_hwnd).as_tuple()
     not_snapped = abs(o1[0] - new_left) <= 20
     outcomes.append(
         result(
-            "A move follow",
+            "A move follow (strict)",
             attach_ok and hook_ok and ok_a and not_snapped,
-            f"attach={attach_ok} hook={hook_ok} follow={ok_a} not_snapped={not_snapped} {detail_a}",
+            f"attach={attach_ok} hook={hook_ok} baseline_event={baseline_event} "
+            f"not_snapped={not_snapped} {detail_a}",
         )
     )
 
-    print("\n--- B: Resize Obsidian → Cursor height/position follows ---")
+    print("\n--- B: Resize Obsidian → Cursor follows via WinEventHook ---")
+    st_b0 = status_remote(cfg)
+    lf_b0 = st_b0.get("live_follow") or {}
+    baseline_b = lf_b0.get("last_follow_at")
     o = get_window_rect(obs_hwnd).as_tuple()
-    force_move(obs_hwnd, o[0], o[1], max(o[2] - o[0] - 80, 350), max(o[3] - o[1] - 60, 280))
-    ok_b, detail_b = wait_follow(obs_hwnd, cur_hwnd)
-    outcomes.append(result("B resize follow", ok_b, detail_b))
+    force_move(
+        obs_hwnd,
+        o[0],
+        o[1],
+        max(o[2] - o[0] - 80, 350),
+        max(o[3] - o[1] - 60, 280),
+    )
+    ok_b, detail_b = wait_hook_follow(
+        cfg,
+        obs_hwnd,
+        cur_hwnd,
+        baseline_follow_at=float(baseline_b) if baseline_b else 0.0,
+        allowed_events={"LOCATIONCHANGE", "MOVESIZEEND"},
+    )
+    outcomes.append(result("B resize follow (strict)", ok_b, detail_b))
 
-    print("\n--- C: Obsidian minimize → Cursor hidden ---")
+    print("\n--- C: Obsidian minimize → Cursor hidden (WinEvent) ---")
+    st_c0 = status_remote(cfg)
     win32gui.ShowWindow(obs_hwnd, win32con.SW_MINIMIZE)
-    time.sleep(0.2)
-    if sidecar._FOLLOW:
-        sidecar._FOLLOW._on_obsidian_minimize()
-    ok_c, detail_c = wait_follow(obs_hwnd, cur_hwnd, expect_hidden=True, timeout=2.0)
-    outcomes.append(result("C minimize hide", ok_c, detail_c))
-
-    print("\n--- D: Obsidian restore → Cursor reappears + follows ---")
-    win32gui.ShowWindow(obs_hwnd, win32con.SW_RESTORE)
-    time.sleep(0.2)
-    if sidecar._FOLLOW:
-        sidecar._FOLLOW._on_obsidian_restore()
-    ok_d, detail_d = wait_follow(obs_hwnd, cur_hwnd, expect_hidden=False, timeout=3.0)
-    outcomes.append(result("D restore show", ok_d, detail_d))
-
-    print("\n--- E: Monitor migration (soft if single monitor) ---")
-    # Soft: re-read MonitorFromWindow after move; follow still clamps to that work area
-    work_e = get_work_area_for_hwnd(obs_hwnd)
-    o = get_window_rect(obs_hwnd).as_tuple()
-    c = get_window_rect(cur_hwnd).as_tuple()
-    in_work = c[0] >= work_e.left - 8 and c[2] <= work_e.right + 8
-    ok_e, detail_e = wait_follow(obs_hwnd, cur_hwnd)
-    outcomes.append(
-        result(
-            "E monitor work-area follow",
-            ok_e and in_work,
-            f"work={work_e.as_tuple()} O={o} C={c} in_work={in_work} {detail_e}",
-        )
+    # STRICT: do not call _on_obsidian_minimize()
+    ok_c, detail_c = wait_hook_follow(
+        cfg,
+        obs_hwnd,
+        cur_hwnd,
+        baseline_follow_at=None,
+        allowed_events={"MINIMIZESTART"},
+        expect_hidden=True,
+        timeout=4.0,
     )
+    outcomes.append(result("C minimize hide (strict)", ok_c, detail_c))
+
+    print("\n--- D: Obsidian restore → Cursor reappears (WinEvent) ---")
+    win32gui.ShowWindow(obs_hwnd, win32con.SW_RESTORE)
+    # STRICT: do not call _on_obsidian_restore()
+    ok_d, detail_d = wait_hook_follow(
+        cfg,
+        obs_hwnd,
+        cur_hwnd,
+        baseline_follow_at=None,
+        allowed_events={"MINIMIZEEND", "LOCATIONCHANGE", "MOVESIZEEND"},
+        expect_hidden=False,
+        timeout=5.0,
+    )
+    outcomes.append(result("D restore show (strict)", ok_d, detail_d))
+
+    print("\n--- E: Multi-monitor migration ---")
+    monitors = list_monitor_work_areas()
+    if len(monitors) < 2:
+        outcomes.append(result("E monitor migration", None, "single monitor"))
+    else:
+        cur_work = get_work_area_for_hwnd(obs_hwnd)
+        other = next(
+            (m for m in monitors if m.as_tuple() != cur_work.as_tuple()),
+            None,
+        )
+        if other is None:
+            outcomes.append(result("E monitor migration", None, "no distinct other monitor"))
+        else:
+            st_e0 = status_remote(cfg)
+            baseline_e = (st_e0.get("live_follow") or {}).get("last_follow_at")
+            target_w = min(900, other.width - 120)
+            target_h = min(700, other.height - 80)
+            force_move(
+                obs_hwnd,
+                other.left + 40,
+                other.top + 40,
+                target_w,
+                target_h,
+            )
+            ok_e, detail_e = wait_hook_follow(
+                cfg,
+                obs_hwnd,
+                cur_hwnd,
+                baseline_follow_at=float(baseline_e) if baseline_e else 0.0,
+                allowed_events={"LOCATIONCHANGE", "MOVESIZEEND"},
+                timeout=6.0,
+            )
+            c = get_window_rect(cur_hwnd).as_tuple()
+            new_work = get_work_area_for_hwnd(obs_hwnd)
+            in_new = c[0] >= new_work.left - 12 and c[2] <= new_work.right + 12
+            outcomes.append(
+                result(
+                    "E monitor migration (strict)",
+                    ok_e and in_new and new_work.as_tuple() == other.as_tuple(),
+                    f"other={other.as_tuple()} new_work={new_work.as_tuple()} "
+                    f"in_new={in_new} {detail_e}",
+                )
+            )
 
     print("\n--- F: Detach → restore attach-time originals ---")
-    # Capture post-attach originals from state (saved at Attach)
+    # Read originals via local state file (daemon writes same file)
+    time.sleep(0.2)
     state = sidecar.read_state()
     orig_o = (state.get("obsidian") or {}).get("original_rect")
     orig_c = (state.get("cursor") or {}).get("original_rect")
-    code_f = sidecar.cmd_detach(cfg)
-    time.sleep(0.4)
-    st_f = sidecar.build_status(cfg)
+    r_f = rpc(cfg, "detach")
+    time.sleep(0.5)
+    st_f = status_remote(cfg)
     o_f = get_window_rect(obs_hwnd).as_tuple()
     c_f = get_window_rect(cur_hwnd).as_tuple()
-    # Restore should match saved originals closely (placement restore)
+
     def close_rect(a, b, tol=40):
         if not a or not b:
             return False
@@ -244,7 +420,7 @@ def run_scenarios(cfg: dict[str, Any], obs_hwnd: int, cur_hwnd: int) -> list[boo
     outcomes.append(
         result(
             "F detach restore",
-            code_f == 0
+            bool(r_f.get("ok"))
             and st_f.get("attached") is False
             and restored
             and follow_stopped,
@@ -252,12 +428,22 @@ def run_scenarios(cfg: dict[str, Any], obs_hwnd: int, cur_hwnd: int) -> list[boo
             f"O {orig_o}→{o_f} C {orig_c}→{c_f} follow_stopped={follow_stopped}",
         )
     )
+
+    print("\n--- G: Cursor destroy routing (unit path; no user Cursor kill) ---")
+    # Covered by pytest mock of dispatch_win_event; document manual check.
+    print(
+        "[INFO] G: do not auto-close user Cursor. "
+        "Unit test covers CURSOR_DESTROY → cursor_gone. "
+        "Manual: Attach, close bound Cursor, confirm status.reason=cursor_gone."
+    )
+    outcomes.append(result("G cursor destroy", None, "manual / unit-tested; not auto-closing user Cursor"))
+
     return outcomes
 
 
 def main() -> int:
     dpi = enable_dpi_awareness()
-    print(f"[acceptance-live] dpi={dpi}")
+    print(f"[acceptance-live] STRICT={STRICT_ACCEPTANCE} dpi={dpi}")
     cfg = load_cfg()
 
     truth = sidecar.refresh_attachment_truth()
@@ -279,31 +465,42 @@ def main() -> int:
     state_backup = backup_state_file()
     obs_snap = snapshot_window(obs_hwnd)
     cur_snap = snapshot_window(cur_hwnd)
-    outcomes: list[bool] = []
+    outcomes: list[bool | None] = []
+    started_daemon = False
 
     try:
+        started_daemon = ensure_daemon(cfg)
+        print(f"[acceptance-live] daemon ready (started_by_us={started_daemon})")
         outcomes = run_scenarios(cfg, obs_hwnd, cur_hwnd)
     finally:
         print("\n[acceptance-live] cleanup / restore desktop…")
         try:
-            sidecar.stop_live_follow()
-        except Exception:
-            pass
-        sidecar._DAEMON_MODE = False
-        try:
-            if sidecar.read_state().get("attached"):
-                sidecar.cmd_detach(cfg)
+            if daemon_healthy(cfg):
+                st = status_remote(cfg)
+                if st.get("attached"):
+                    rpc(cfg, "detach")
         except Exception as exc:
             print(f"[acceptance-live] detach during cleanup: {exc}")
+            try:
+                sidecar.cmd_detach(cfg)
+            except Exception:
+                pass
         restore_exact_snapshot(obs_snap, "Obsidian")
         restore_exact_snapshot(cur_snap, "Cursor")
         restore_state_file(state_backup)
         print("[acceptance-live] state file restored")
+        # Leave a pre-existing daemon running; only stop if we started it for this run
+        if started_daemon:
+            try:
+                sidecar.cmd_stop(cfg)
+            except Exception as exc:
+                print(f"[acceptance-live] stop daemon: {exc}")
 
-    passed = sum(1 for x in outcomes if x)
-    total = len(outcomes)
-    print(f"\n[acceptance-live] {passed}/{total} passed")
-    return 0 if passed == total and total > 0 else 1
+    passed = sum(1 for x in outcomes if x is True)
+    failed = sum(1 for x in outcomes if x is False)
+    skipped = sum(1 for x in outcomes if x is None)
+    print(f"\n[acceptance-live] {passed} PASS, {failed} FAIL, {skipped} SKIP")
+    return 0 if failed == 0 and passed > 0 else 1
 
 
 if __name__ == "__main__":

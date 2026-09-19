@@ -229,18 +229,27 @@ class LiveFollowService:
             return
         # Only top-level object interest
         if idObject != 0 or idChild != 0:
-            # LOCATIONCHANGE etc. often use OBJID_WINDOW=0; destroy may differ
             if idObject not in (0, win32con.OBJID_WINDOW):
                 return
         hwnd_i = int(hwnd or 0)
         if not hwnd_i:
             return
+        self.dispatch_win_event(int(event), hwnd_i)
 
-        # Ignore our own SetWindowPos echo window
+    def dispatch_win_event(self, event: int, hwnd_i: int) -> str:
+        """Route a WinEvent. Public for unit tests; does not require a live OS hook."""
+        # Cursor destroy must be handled even though we ignore other Cursor events
+        if hwnd_i == self.cursor_hwnd and event == EVENT_OBJECT_DESTROY:
+            self.last_event = "CURSOR_DESTROY"
+            self._handle_cursor_gone()
+            return "CURSOR_DESTROY"
+
+        # Ignore our own SetWindowPos echo (defense in depth; we filter to Obsidian)
         if hwnd_i == self.cursor_hwnd and time.time() < self._suppress_until:
-            return
+            return "ignore_suppress"
+
         if hwnd_i != self.obsidian_hwnd:
-            return
+            return "ignore_hwnd"
 
         if self.debug:
             log.debug("event=%s hwnd=%s", event, hwnd_i)
@@ -248,35 +257,37 @@ class LiveFollowService:
         if event == EVENT_SYSTEM_MOVESIZESTART:
             self.last_event = "MOVESIZESTART"
             self.obsidian_user_moving = True
-            return
+            return "MOVESIZESTART"
 
         if event == EVENT_SYSTEM_MOVESIZEEND:
             self.last_event = "MOVESIZEEND"
             self.obsidian_user_moving = False
             self._debouncer.flush()
-            return
+            return "MOVESIZEEND"
 
         if event == EVENT_SYSTEM_MINIMIZESTART:
             self.last_event = "MINIMIZESTART"
             self._on_obsidian_minimize()
-            return
+            return "MINIMIZESTART"
 
         if event == EVENT_SYSTEM_MINIMIZEEND:
             self.last_event = "MINIMIZEEND"
             self._on_obsidian_restore()
-            return
+            return "MINIMIZEEND"
 
         if event == EVENT_OBJECT_DESTROY:
             self.last_event = "DESTROY"
             self._handle_obsidian_gone()
-            return
+            return "DESTROY"
 
         if event == EVENT_OBJECT_LOCATIONCHANGE:
             self.last_event = "LOCATIONCHANGE"
             if self._self_applying:
-                return
+                return "ignore_self_applying"
             self._debouncer.trigger()
-            return
+            return "LOCATIONCHANGE"
+
+        return "ignore_event"
 
     def _bindings_ok(self) -> tuple[bool, str]:
         state = self._get_attached_state()

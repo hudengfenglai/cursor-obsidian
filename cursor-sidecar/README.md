@@ -68,9 +68,16 @@ Windows-only harnesses (not CI). Refuse to run if Sidecar is attached. Self-rest
 
 ```powershell
 python acceptance_run.py          # v0.2.1 lifecycle (6 scenarios)
-python acceptance_live_follow.py  # v0.3 live follow (A–F)
+python acceptance_live_follow.py  # v0.3 STRICT live follow (WinEventHook; no rescue)
 ```
+
+`acceptance_live_follow.py` default is **STRICT**: uses an out-of-process daemon and never calls `follow_now()` / private minimize handlers. Multi-monitor scenario **SKIP**s on single-monitor systems (not counted as PASS).
 
 ## Out of scope (v0.4+)
 
 Note sync / Open current file / PyInstaller / SetParent / embedding / Cursor CLI / ACP
+
+## Remaining limitations
+
+- When no usable space remains to the right of Obsidian, follow placement is constrained by the monitor work area (Cursor may park at the work-area edge and overlap Obsidian). Hide / suspend / left-side fallback is deferred until after v0.3 stable feedback.
+- `poll_ms` / `follow_obsidian` remain in `config.json` for compatibility but are unused by Live Follow.
