@@ -31,9 +31,28 @@ python main.py status --json
 
 ```powershell
 pytest
-python -m py_compile main.py window.py geometry.py
+python -m py_compile main.py window.py geometry.py acceptance_run.py
 node --check ../obsidian-plugin/main.js
 ```
+
+## Acceptance testing
+
+`cursor-sidecar/acceptance_run.py` is a **Windows-only** acceptance harness (not a CI unit test).
+
+It checks:
+
+- maximize → attach → detach restore
+- existing Cursor → attach (not hide)
+- bound HWND stability across arrange/focus
+- stale binding detection (`cursor_gone`, etc.)
+- do not restore another Cursor window when the bound one is gone
+- DPI / monitor work area via `MonitorFromWindow`
+
+```powershell
+python acceptance_run.py
+```
+
+Requires Obsidian and Cursor Desktop windows to be open.
 
 ## Out of scope
 
