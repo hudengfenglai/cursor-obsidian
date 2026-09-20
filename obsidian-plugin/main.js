@@ -541,14 +541,47 @@ class CursorSidecarPlugin extends Plugin {
   async ensureAttachedForEmbed() {
     try {
       const up = await this.ensureDaemon();
-      if (!up) return false;
-      const st = await this.httpJson("GET", "/status");
-      const status = (st && st.status) || st || {};
-      if (status.attached) return true;
-    } catch (_e) {
-      /* fall through */
+      if (!up) {
+        this.notify("Cursor Sidecar: daemon unavailable — cannot auto-Attach", true);
+        return false;
+      }
+      let st = await this.httpJson("GET", "/status");
+      let status = (st && st.status) || st || {};
+      if (status.attached === true) {
+        return true;
+      }
+      // One-shot orchestration: launch Editor (if needed) + Attach + bind HWND
+      this.notify("Cursor Sidecar: auto-Attach…");
+      const attachResult = await this.httpJson(
+        "POST",
+        "/rpc",
+        this.buildRpcBody("attach"),
+        { timeoutMs: 60000 }
+      );
+      if (!attachResult || attachResult.ok === false) {
+        const err =
+          (attachResult && (attachResult.error || attachResult.reason || attachResult.code)) ||
+          "attach failed";
+        this.notify(`Auto-Attach failed: ${String(err).slice(0, 240)}`, true);
+        return false;
+      }
+      if (attachResult.attached === true) {
+        return true;
+      }
+      // Brief poll in case status lags behind attach return
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        await sleep(300);
+        st = await this.httpJson("GET", "/status");
+        status = (st && st.status) || st || {};
+        if (status.attached === true) return true;
+      }
+      this.notify("Auto-Attach did not reach attached=true", true);
+      return false;
+    } catch (err) {
+      this.notify(`Auto-Attach error: ${err.message || err}`, true);
+      return false;
     }
-    return false;
   }
 
   async refreshAgentsPaneUi() {
@@ -689,7 +722,7 @@ class CursorSidecarPlugin extends Plugin {
     await this.saveSettings();
     const attached = await this.ensureAttachedForEmbed();
     if (!attached) {
-      this.notify("Attach Cursor Sidecar first.", true);
+      this.notify("Open Native Agents Pane aborted: auto-Attach failed.", true);
       return;
     }
     const leaf = await this.ensureAgentsPaneLeaf();
@@ -725,11 +758,16 @@ class CursorSidecarPlugin extends Plugin {
       pane.borderless = true;
     }
     try {
-      const result = await this.httpJson("POST", "/rpc", {
-        cmd: "open-native-agents-pane",
-        pane,
-        backend: "native_child",
-      });
+      const result = await this.httpJson(
+        "POST",
+        "/rpc",
+        {
+          cmd: "open-native-agents-pane",
+          pane,
+          backend: "native_child",
+        },
+        { timeoutMs: 90000 }
+      );
       if (!result || result.ok === false) {
         this._embedActive = false;
         this._nativeVerified = false;
@@ -813,7 +851,7 @@ class CursorSidecarPlugin extends Plugin {
     }
     const attached = await this.ensureAttachedForEmbed();
     if (!attached) {
-      this.notify("Attach Cursor Sidecar first.", true);
+      this.notify("Open Native Agents Pane aborted: auto-Attach failed.", true);
       return;
     }
     if (!view) {
@@ -1518,11 +1556,12 @@ class CursorSidecarPlugin extends Plugin {
       .catch(() => false);
   }
 
-  httpJson(method, urlPath, body) {
+  httpJson(method, urlPath, body, opts = {}) {
     const host = this.settings.daemonHost || "127.0.0.1";
     const port = Number(this.settings.daemonPort) || 27845;
     const token = this.resolveDaemonToken();
     const payload = body ? JSON.stringify(body) : null;
+    const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 20000;
     const headers = {
       "X-Cursor-Sidecar-Token": token,
     };
@@ -1538,7 +1577,7 @@ class CursorSidecarPlugin extends Plugin {
           path: urlPath,
           method,
           headers,
-          timeout: 20000,
+          timeout: timeoutMs,
         },
         (res) => {
           let data = "";
