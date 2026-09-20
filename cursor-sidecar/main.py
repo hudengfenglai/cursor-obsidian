@@ -825,12 +825,29 @@ def cmd_attach(
         # Fresh editor selection: EDITOR only (Agents never bind as editor)
         sel = select_editor_window(cfg["cursor_process"])
         if not sel.get("ok"):
-            # Wait briefly for Editor if only Agents present / still launching
+            # Cold start often restores Agents-only — open a classic Editor window
+            if sel.get("error") == "editor_window_not_found":
+                try:
+                    resolved = resolve_cursor_executable(
+                        cfg,
+                        binding=get_editor_binding(state) or state.get("cursor"),
+                        persist=True,
+                    )
+                    exe = resolved.get("path") if resolved.get("ok") else None
+                    if exe:
+                        args = ["--classic", "-n"]
+                        if workspace:
+                            args.append(str(workspace))
+                        print(f"[sidecar] no Editor classified — launching {' '.join(args)}")
+                        launch_process(exe, args=args)
+                except Exception as exc:
+                    print(f"[sidecar] classic Editor launch failed: {exc}")
+
             def _wait_editor():
                 s2 = select_editor_window(cfg["cursor_process"])
                 return s2 if s2.get("ok") else None
 
-            waited = wait_for_window(_wait_editor, timeout_s=8.0, poll_s=0.35)
+            waited = wait_for_window(_wait_editor, timeout_s=12.0, poll_s=0.35)
             if waited and waited.get("ok"):
                 sel = waited
             else:
@@ -838,6 +855,8 @@ def cmd_attach(
                 print(f"[sidecar] Cursor Editor not found ({err})")
                 if err == "editor_window_ambiguous":
                     print("[sidecar] multiple Editor candidates — refusing to guess")
+                if err == "editor_window_not_found":
+                    print("[sidecar] Agents Window cannot become Editor binding")
                 return 1
 
         from window import window_info_from_hwnd
@@ -1856,7 +1875,9 @@ def enter_embedded_pane(cfg: dict[str, Any], pane: dict[str, Any]) -> dict[str, 
         auto_bind: dict[str, Any] | None = None
         if not ag_ok.get("ok"):
             if use_native:
-                auto_bind = ensure_agents_window_bound(cfg, state)
+                auto_bind = ensure_agents_window_bound(
+                    cfg, state, persist_fn=write_state
+                )
                 if not auto_bind.get("ok"):
                     write_state(state)
                     return {

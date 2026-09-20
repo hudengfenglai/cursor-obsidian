@@ -567,12 +567,13 @@ class CursorSidecarPlugin extends Plugin {
       const status = (st && st.status) || st || {};
       const agent = status.cursor_agent || {};
       const emb = status.embedded || {};
-      // Live truth only — never trust stale agent_bound memory alone
-      const liveBound = !!(agent.ok || agent.bound || emb.agent_bound);
-      if (emb.agent_stale_reason || status.agent_stale_reason) {
+      // Live truth only — never trust stale agent_bound / invalid HWND
+      const win32 = emb.win32 || {};
+      if (win32.error === "invalid_hwnd" || emb.agent_stale_reason || status.agent_stale_reason) {
         view.renderPaneUi("closed");
         return;
       }
+      const liveBound = agent.ok === true && !!agent.hwnd && emb.agent_bound === true;
       if (liveBound) {
         view.renderPaneUi("ready");
       } else {

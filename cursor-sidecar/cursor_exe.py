@@ -21,6 +21,10 @@ _STANDARD_CANDIDATES = (
     r"%LOCALAPPDATA%\cursor\Cursor.exe",
     r"C:\Program Files\Cursor\Cursor.exe",
     r"C:\Program Files (x86)\Cursor\Cursor.exe",
+    # Common portable / custom installs (user machines)
+    r"E:\cursor\Cursor.exe",
+    r"D:\cursor\Cursor.exe",
+    r"C:\cursor\Cursor.exe",
 )
 
 

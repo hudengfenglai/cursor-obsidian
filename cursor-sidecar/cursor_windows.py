@@ -40,6 +40,18 @@ _TITLE_CURSOR_ONLY_RE = re.compile(r"^Cursor\s*$", re.I)
 _TITLE_AGENTS_PRODUCT_RE = re.compile(r"^Cursor\s+Agents?\b|\bAgents?\s+Window\b", re.I)
 
 
+def title_looks_like_agents_window(title: str | None) -> bool:
+    """Hard title gate — these must never become Editor bindings."""
+    t = (title or "").strip()
+    if not t:
+        return False
+    if _TITLE_AGENTS_PRODUCT_RE.search(t):
+        return True
+    # Exact product title variants
+    tl = t.lower()
+    return tl in ("cursor agents", "cursor agent", "agents window", "agent window")
+
+
 def migrate_cursor_roles(state: dict[str, Any]) -> dict[str, Any]:
     """Ensure cursor_editor / cursor_agent keys exist; keep legacy state['cursor']."""
     if not isinstance(state, dict):
@@ -166,11 +178,20 @@ def score_cursor_window(hwnd: int, *, title: str | None = None) -> dict[str, Any
     title_l = (title or "").lower().strip()
 
     # --- Title signals (Electron often has no Win32 menu; titles must carry weight) ---
-    if _TITLE_AGENTS_PRODUCT_RE.search(title or "") or (
+    if title_looks_like_agents_window(title) or (
         _TITLE_AGENT_RE.search(title_l) and " - " not in title_l
     ):
         agent_score += 2
         signals.append("title_agents_product")
+        # Hard override: product Agents titles cannot be EDITOR regardless of menus/UIA
+        return {
+            "hwnd": hwnd,
+            "title": title,
+            "role": ROLE_AGENT,
+            "editor_score": 0,
+            "agent_score": max(agent_score, CLASSIFY_THRESHOLD),
+            "signals": signals + ["hard_agents_title_gate"],
+        }
     elif _TITLE_AGENT_RE.search(title_l) and "editor" not in title_l:
         agent_score += 1
         signals.append("title_agents")
@@ -415,9 +436,13 @@ def bind_agent_from_hwnd(hwnd: int, process_name: str = "Cursor.exe") -> dict[st
 
 
 def bind_editor_from_hwnd(hwnd: int, process_name: str = "Cursor.exe") -> dict[str, Any] | None:
-    # Hard gate: refuse AGENT classification
-    role = classify_cursor_window(int(hwnd))
-    if role == ROLE_AGENT:
+    """Bind only a live ROLE_EDITOR. Never AGENT / Agents-titled / UNKNOWN."""
+    scored = score_cursor_window(int(hwnd))
+    role = str(scored.get("role") or ROLE_UNKNOWN)
+    title = str(scored.get("title") or "")
+    if title_looks_like_agents_window(title) or role == ROLE_AGENT:
+        return None
+    if role != ROLE_EDITOR:
         return None
     info = window_info_from_hwnd(int(hwnd))
     if not info:
@@ -450,11 +475,16 @@ def editor_binding_ok(state: dict[str, Any]) -> dict[str, Any]:
     check = validate_window_binding(ed)
     if not check.get("ok"):
         return {"ok": False, "reason": "stale_editor", "detail": check}
-    # Live role: refuse if HWND is now classified AGENT
+    # Live role: refuse AGENT / Agents-titled windows
     try:
-        role = classify_cursor_window(int(ed.get("hwnd") or 0))
-        if role == ROLE_AGENT:
-            return {"ok": False, "reason": "editor_is_agent", "role": role}
+        hwnd_i = int(ed.get("hwnd") or 0)
+        scored = score_cursor_window(hwnd_i)
+        role = str(scored.get("role") or "")
+        title = str(scored.get("title") or ed.get("title") or "")
+        if title_looks_like_agents_window(title) or role == ROLE_AGENT:
+            return {"ok": False, "reason": "editor_is_agent", "role": role, "title": title}
+        if role and role != ROLE_EDITOR:
+            return {"ok": False, "reason": "editor_not_classified_editor", "role": role}
     except Exception:
         pass
     return {"ok": True, "binding": ed}

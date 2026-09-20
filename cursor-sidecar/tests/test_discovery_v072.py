@@ -70,7 +70,17 @@ def test_stale_agent_atomic_clear_keeps_editor(monkeypatch):
         return {"ok": True}
 
     monkeypatch.setattr("cursor_windows.validate_window_binding", fake_validate)
-    monkeypatch.setattr("cursor_windows.classify_cursor_window", lambda *_a, **_k: ROLE_EDITOR)
+    monkeypatch.setattr(
+        "cursor_windows.score_cursor_window",
+        lambda hwnd, title=None: {
+            "hwnd": hwnd,
+            "title": title or "a.py - vault - Cursor",
+            "role": ROLE_EDITOR,
+            "editor_score": 3,
+            "agent_score": 0,
+            "signals": [],
+        },
+    )
     r = refresh_cursor_bindings(state)
     assert r["cleared_agent"] is True
     assert r["editor_ok"] is True
@@ -229,6 +239,17 @@ def test_cursor_agents_title_classifies_agent(monkeypatch):
 
     r = score_cursor_window(1, title="Cursor Agents")
     assert r["role"] == ROLE_AGENT
+    assert "hard_agents_title_gate" in r["signals"]
+
+
+def test_bind_editor_refuses_cursor_agents_title(monkeypatch):
+    monkeypatch.setattr("cursor_windows.win32gui.IsWindow", lambda _h: True)
+    monkeypatch.setattr("cursor_windows.win32gui.GetWindowText", lambda _h: "Cursor Agents")
+    monkeypatch.setattr("cursor_windows._menu_labels", lambda _h: [])
+    monkeypatch.setattr("cursor_windows._uia_name_hits", lambda _h: {})
+    from cursor_windows import bind_editor_from_hwnd
+
+    assert bind_editor_from_hwnd(99) is None
 
 
 def test_bare_cursor_title_is_ambiguous(monkeypatch):

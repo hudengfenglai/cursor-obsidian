@@ -16,7 +16,9 @@
   "launch_cursor_if_missing": true,
   "cursor_exe_candidates": [
     "%LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe",
-    "%LOCALAPPDATA%\\cursor\\Cursor.exe"
+    "%LOCALAPPDATA%\\cursor\\Cursor.exe",
+    "E:\\cursor\\Cursor.exe",
+    "D:\\cursor\\Cursor.exe"
   ],
   "embed_backend": "native_child"
 }

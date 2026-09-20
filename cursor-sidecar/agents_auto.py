@@ -31,6 +31,7 @@ from cursor_windows import (
     agent_hwnd,
     bind_agent_from_hwnd,
     editor_hwnd,
+    get_agent_binding,
     get_editor_binding,
     list_cursor_top_level,
     list_cursor_windows_classified,
@@ -320,7 +321,7 @@ def trigger_new_agents_window(
 ) -> dict[str, Any]:
     """
     Try triggers in order; only return ok=True when a new Agent HWND is confirmed.
-    Priority: win32_menu → cli_glass → alt_file_menu → uia_menu → command_palette
+    Priority: cli_glass → win32_menu → alt_file_menu → uia_menu → command_palette
     """
     list_fn = list_fn or list_cursor_top_level
     classify_list_fn = classify_list_fn or list_cursor_windows_classified
@@ -355,17 +356,17 @@ def trigger_new_agents_window(
         attempts[-1]["confirm_error"] = confirmed.get("error") or "no_new_window"
         return None
 
-    # A: Win32 GetMenu
-    hit = _try("win32_menu", trigger_new_agents_via_win32_menu(eh))
-    if hit:
-        return hit
-
-    # B: Public CLI — Cursor.exe --glass -n (no SendInput / focus required)
+    # A: Public CLI first — Cursor.exe --glass -n (reliable create; no SendInput)
     hit = _try(
         "cli_glass",
         trigger_agents_window_via_cli_glass(cfg=cfg, binding=binding),
         confirm_s=8.0,
     )
+    if hit:
+        return hit
+
+    # B: Win32 GetMenu
+    hit = _try("win32_menu", trigger_new_agents_via_win32_menu(eh))
     if hit:
         return hit
 
@@ -523,6 +524,7 @@ def ensure_agents_window_bound(
     list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
     classify_list_fn: Callable[[str], list[dict[str, Any]]] | None = None,
     bind_fn: Callable[..., dict[str, Any] | None] | None = None,
+    persist_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     proc = str(cfg.get("cursor_process") or "Cursor.exe")
     bind_fn = bind_fn or bind_agent_from_hwnd
@@ -531,6 +533,13 @@ def ensure_agents_window_bound(
     trigger_fn = trigger_fn or trigger_new_agents_window
 
     refresh = refresh_cursor_bindings(state)
+    # Always drop ghost agent_bound when live validate fails
+    if not refresh.get("agent_ok"):
+        state["agent_bound"] = False
+        if not get_agent_binding(state):
+            state["cursor_agent"] = None
+    if persist_fn and (refresh.get("cleared_editor") or refresh.get("cleared_agent")):
+        persist_fn(state)
     before_snapshot = list_fn(proc)
 
     if agent_binding_ok(state).get("ok"):
