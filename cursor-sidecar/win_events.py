@@ -345,7 +345,7 @@ class LiveFollowService:
             self._nudge_timer.daemon = True
             self._nudge_timer.start()
 
-    def _nudge_native_child(self, reason: str = "") -> None:
+    def _nudge_native_child(self, reason: str = "", *, focus: bool = False) -> None:
         if self._stop.is_set():
             return
         if self.embed_backend != "native_child" or self.follow_mode != "pane":
@@ -362,9 +362,16 @@ class LiveFollowService:
 
             self._self_applying = True
             self._suppress_until = time.time() + 0.15
-            result = nudge_native_child(ah)
+            want_focus = bool(focus) or reason in (
+                "AGENT_CAPTUREEND",
+                "AGENT_FOREGROUND",
+            )
+            # Keepalive must NOT steal/restore focus (would fight the note editor)
+            if reason == "keepalive":
+                want_focus = False
+            result = nudge_native_child(ah, focus=want_focus)
             if self.debug:
-                log.debug("native-nudge[%s] -> %s", reason, result)
+                log.debug("native-nudge[%s] focus=%s -> %s", reason, want_focus, result)
         except Exception as exc:
             log.error("native nudge error: %s", exc)
         finally:

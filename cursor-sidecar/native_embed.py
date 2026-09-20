@@ -7,6 +7,7 @@ No DLL/Electron injection. Style WS_CHILD/WS_POPUP must be set explicitly
 
 from __future__ import annotations
 
+import ctypes
 import logging
 from typing import Any, Callable, Optional
 
@@ -18,6 +19,7 @@ import win32process
 from pane_geometry import DomPaneRect, map_pane_dict_to_client
 
 log = logging.getLogger("cursor_sidecar.native_child")
+user32 = ctypes.windll.user32
 
 # Style bits we clear / set for native child transition (pure ints for tests too)
 WS_CHILD = int(win32con.WS_CHILD)
@@ -182,12 +184,15 @@ def place_child_in_client(hwnd: int, client_rect: dict[str, int]) -> None:
     )
 
 
-def nudge_native_child(hwnd: int) -> dict[str, Any]:
+def nudge_native_child(hwnd: int, *, focus: bool = False) -> dict[str, Any]:
     """Refresh hit-testing after Electron chrome clicks without moving the child.
 
     SetParent + Electron often loses mouse hit-test after one in-content click
     (e.g. Agents "Editor Window") until the next SetWindowPos — which is why
     dragging Obsidian temporarily "fixes" clicks. This is that SetWindowPos.
+
+    When focus=True (user click), also SetFocus the child so keyboard input
+    stays in Agents instead of leaking into the Obsidian note editor.
     """
     hwnd = int(hwnd or 0)
     if not hwnd or not win32gui.IsWindow(hwnd):
@@ -219,7 +224,72 @@ def nudge_native_child(hwnd: int) -> dict[str, Any]:
             )
         except Exception:
             pass
-        return {"ok": True, "applied": "nudge"}
+        focused = False
+        if focus:
+            focused = bool(focus_native_child(hwnd).get("ok"))
+        return {"ok": True, "applied": "nudge", "focused": focused}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def focus_native_child(hwnd: int) -> dict[str, Any]:
+    """Give keyboard focus to the SetParent'd Agents child (not Obsidian's editor)."""
+    hwnd = int(hwnd or 0)
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return {"ok": False, "error": "agent_gone"}
+    try:
+        parent = int(win32gui.GetParent(hwnd) or 0)
+        # Activate the top-level host first; WS_CHILD cannot be foreground alone.
+        if parent and win32gui.IsWindow(parent):
+            try:
+                from window import force_foreground
+
+                force_foreground(parent, retries=2)
+            except Exception:
+                try:
+                    win32gui.SetForegroundWindow(parent)
+                except Exception:
+                    pass
+
+        cur_tid = int(win32api.GetCurrentThreadId())
+        tgt_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
+        parent_tid = 0
+        if parent:
+            try:
+                parent_tid, _ = win32process.GetWindowThreadProcessId(parent)
+            except Exception:
+                parent_tid = 0
+
+        attached: list[int] = []
+        try:
+            for tid in (tgt_tid, parent_tid):
+                tid_i = int(tid or 0)
+                if tid_i and tid_i != cur_tid and tid_i not in attached:
+                    if user32.AttachThreadInput(cur_tid, tid_i, True):
+                        attached.append(tid_i)
+            win32gui.SetFocus(hwnd)
+            try:
+                # Best-effort: some Electron builds want the child activated too.
+                user32.BringWindowToTop(hwnd)
+            except Exception:
+                pass
+        finally:
+            for tid_i in reversed(attached):
+                try:
+                    user32.AttachThreadInput(cur_tid, tid_i, False)
+                except Exception:
+                    pass
+
+        try:
+            focused = int(win32gui.GetFocus() or 0)
+        except Exception:
+            focused = 0
+        return {
+            "ok": True,
+            "applied": "focus",
+            "focus_hwnd": focused or None,
+            "agent_hwnd": hwnd,
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 

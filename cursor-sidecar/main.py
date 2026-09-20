@@ -84,6 +84,7 @@ from window import (
     get_foreground_hwnd,
     get_work_area_for_hwnd,
     get_window_rect,
+    hide_window,
     is_process_running,
     launch_process,
     resolve_bound_window,
@@ -754,14 +755,39 @@ def _monitor_arg(cfg: dict[str, Any]) -> int | None:
     return int(monitor)
 
 
+def _prepare_attach_for_embed(
+    cfg: dict[str, Any], state: dict[str, Any], editor_hwnd_i: int
+) -> None:
+    """Bind-only attach for Native Agents Pane: hide Editor, arm pane follow (no sidecar dock)."""
+    try:
+        hide_window(int(editor_hwnd_i))
+    except Exception as exc:
+        print(f"[sidecar] for_embed hide Editor: {exc}")
+    start_live_follow_if_daemon(cfg, state)
+    if _FOLLOW:
+        # Pane mode with no agent yet — prevents sidecar follow from re-showing Editor
+        _FOLLOW.set_follow_mode("pane")
+        _FOLLOW.set_agent_hwnd(0)
+        _FOLLOW.set_last_pane_dom(None)
+        if hasattr(_FOLLOW, "set_embed_backend"):
+            _FOLLOW.set_embed_backend("native_child")
+
+
 def cmd_attach(
     cfg: dict[str, Any],
     workspace: str | None = None,
     file_path: str | None = None,
+    *,
+    arrange: bool = True,
+    for_embed: bool = False,
 ) -> int:
-    """Attach Sidecar: save originals once, bind HWNDs, arrange by preset. Idempotent."""
+    """Attach Sidecar: save originals once, bind HWNDs, arrange by preset. Idempotent.
+
+    for_embed=True (Open Native Agents Pane): bind only — do not dock Editor to the
+    right edge (that steals focus / looks like a second editor beside the note).
+    """
+    arrange = bool(arrange) and not bool(for_embed)
     with LIFECYCLE_LOCK:
-        # Prefer preset stored in state if present
         state0 = read_state()
         if state0.get("preset"):
             try:
@@ -792,40 +818,48 @@ def cmd_attach(
                 cfg["obsidian_process"],
                 cfg.get("obsidian_title_hint", ""),
             )
-            # Prefer live editor binding — never rediscover via largest window
             cur_b = None
             if editor_binding_ok(state).get("ok"):
                 from window import window_info_from_hwnd
 
                 cur_b = window_info_from_hwnd(editor_hwnd(state))
             if obs_b and cur_b:
-                left, right = arrange_bound_windows(
-                    obs_b,
-                    cur_b,
-                    obsidian_ratio=cfg["obsidian_ratio"],
-                    cursor_ratio=cfg["cursor_ratio"],
-                    gap=cfg["gap"],
-                    monitor=_monitor_arg(cfg),
-                )
-                state["left_rect"] = list(left.as_tuple())
-                state["right_rect"] = list(right.as_tuple())
+                if arrange:
+                    left, right = arrange_bound_windows(
+                        obs_b,
+                        cur_b,
+                        obsidian_ratio=cfg["obsidian_ratio"],
+                        cursor_ratio=cfg["cursor_ratio"],
+                        gap=cfg["gap"],
+                        monitor=_monitor_arg(cfg),
+                    )
+                    state["left_rect"] = list(left.as_tuple())
+                    state["right_rect"] = list(right.as_tuple())
                 state["attached"] = True
                 state["preset"] = cfg.get("preset", "normal")
                 state["timestamp"] = time.time()
                 state["stale_reason"] = None
+                state["attach_for_embed"] = bool(for_embed)
                 write_state(state)
-                start_live_follow_if_daemon(cfg, state)
-                if _FOLLOW:
-                    _FOLLOW.update_cursor_width(right.width)
-                    _FOLLOW.follow_now()
-                _open_workspace_in_bound_editor(cfg, state, workspace)
-                print("[sidecar] attach (idempotent rearrange)")
+                if for_embed:
+                    _prepare_attach_for_embed(cfg, state, cur_b.hwnd)
+                    print("[sidecar] attach (idempotent for_embed)")
+                else:
+                    start_live_follow_if_daemon(cfg, state)
+                    if _FOLLOW and state.get("right_rect"):
+                        rr = state["right_rect"]
+                        _FOLLOW.update_cursor_width(max(int(rr[2]) - int(rr[0]), 1))
+                        _FOLLOW.follow_now()
+                    _open_workspace_in_bound_editor(cfg, state, workspace)
+                    print(
+                        "[sidecar] attach (idempotent rearrange)"
+                        if arrange
+                        else "[sidecar] attach (idempotent bind-only)"
+                    )
                 return 0
 
-        # Fresh editor selection: EDITOR only (Agents never bind as editor)
         sel = select_editor_window(cfg["cursor_process"])
         if not sel.get("ok"):
-            # Cold start often restores Agents-only — open a classic Editor window
             if sel.get("error") == "editor_window_not_found":
                 try:
                     resolved = resolve_cursor_executable(
@@ -865,7 +899,6 @@ def cmd_attach(
         if not cur:
             print("[sidecar] Cursor Editor hwnd invalid")
             return 1
-        # Double-check bind refuses AGENT
         cur_snap = bind_editor_from_hwnd(cur.hwnd, process_name=cfg["cursor_process"])
         if not cur_snap:
             print("[sidecar] refused to bind Agents Window as Editor")
@@ -874,14 +907,18 @@ def cmd_attach(
         obs_snap = snapshot_window(obs.hwnd)
         obs_snap["process"] = cfg["obsidian_process"]
 
-        left, right = arrange_bound_windows(
-            obs,
-            cur,
-            obsidian_ratio=cfg["obsidian_ratio"],
-            cursor_ratio=cfg["cursor_ratio"],
-            gap=cfg["gap"],
-            monitor=_monitor_arg(cfg),
-        )
+        if arrange:
+            left, right = arrange_bound_windows(
+                obs,
+                cur,
+                obsidian_ratio=cfg["obsidian_ratio"],
+                cursor_ratio=cfg["cursor_ratio"],
+                gap=cfg["gap"],
+                monitor=_monitor_arg(cfg),
+            )
+        else:
+            left = obs.rect
+            right = cur.rect
 
         prev = read_state()
         migrate_cursor_roles(prev)
@@ -906,16 +943,25 @@ def cmd_attach(
                 "cursor_pid": cur.pid,
             },
             "stale_reason": None,
+            "attach_for_embed": bool(for_embed),
         }
         write_state(new_state)
-        start_live_follow_if_daemon(cfg, new_state)
-        _open_workspace_in_bound_editor(cfg, new_state, workspace)
-        print(
-            f"[sidecar] attached\n"
-            f"  Obsidian hwnd={obs.hwnd} pid={obs.pid}\n"
-            f"  Cursor Editor hwnd={cur.hwnd} pid={cur.pid}\n"
-            f"  preset={cfg.get('preset')} L={left.as_tuple()} R={right.as_tuple()}"
-        )
+        if for_embed:
+            _prepare_attach_for_embed(cfg, new_state, cur.hwnd)
+            print(
+                "[sidecar] attached for_embed\n"
+                f"  Obsidian hwnd={obs.hwnd} pid={obs.pid}\n"
+                f"  Cursor Editor hwnd={cur.hwnd} pid={cur.pid} (hidden)"
+            )
+        else:
+            start_live_follow_if_daemon(cfg, new_state)
+            _open_workspace_in_bound_editor(cfg, new_state, workspace)
+            print(
+                "[sidecar] attached\n"
+                f"  Obsidian hwnd={obs.hwnd} pid={obs.pid}\n"
+                f"  Cursor Editor hwnd={cur.hwnd} pid={cur.pid}\n"
+                f"  preset={cfg.get('preset')} L={left.as_tuple()} R={right.as_tuple()}"
+            )
         return 0
 
 
@@ -2276,6 +2322,17 @@ def focus_agents_window(cfg: dict[str, Any]) -> dict[str, Any]:
             return {"ok": False, "error": "agent_not_bound", "reason": ag_ok.get("reason")}
         ah = agent_hwnd(state)
         try:
+            if state.get("native_child"):
+                from native_embed import focus_native_child
+
+                result = focus_native_child(ah)
+                return {
+                    "ok": bool(result.get("ok")),
+                    "cmd": "focus-agents-window",
+                    "agent_hwnd": ah,
+                    "native": True,
+                    **{k: v for k, v in result.items() if k != "ok"},
+                }
             focus_window(ah)
             return {"ok": True, "cmd": "focus-agents-window", "agent_hwnd": ah}
         except Exception as exc:
@@ -2323,7 +2380,19 @@ def handle_rpc(cfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     preset = body.get("preset")
     try:
         if cmd == "attach":
-            code = cmd_attach(cfg, workspace=workspace, file_path=file_path)
+            for_embed = bool(body.get("for_embed") or body.get("forEmbed"))
+            arrange_raw = body.get("arrange", None)
+            if arrange_raw is None:
+                arrange = not for_embed
+            else:
+                arrange = str(arrange_raw).strip().lower() not in ("0", "false", "no", "off")
+            code = cmd_attach(
+                cfg,
+                workspace=workspace,
+                file_path=file_path,
+                arrange=arrange,
+                for_embed=for_embed,
+            )
         elif cmd == "detach":
             code = cmd_detach(cfg)
         elif cmd == "click":

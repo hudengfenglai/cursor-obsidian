@@ -268,6 +268,7 @@ class CursorSidecarPlugin extends Plugin {
     this._embeddedPaneView = null;
     this._setEmbedActive(false);
     this._nativeVerified = false;
+    this._nativeOpenBusy = false;
     this._commandBusy = false;
     this._runtimeInfo = null;
     this._paneRaf = null;
@@ -578,11 +579,15 @@ class CursorSidecarPlugin extends Plugin {
         return true;
       }
       // One-shot orchestration: launch Editor (if needed) + Attach + bind HWND
+      // for_embed: do NOT dock Editor beside Obsidian (avoids focus steal into note)
       this.notify("Cursor Sidecar: auto-Attach…");
+      const attachBody = this.buildRpcBody("attach");
+      attachBody.for_embed = true;
+      attachBody.arrange = false;
       const attachResult = await this.httpJson(
         "POST",
         "/rpc",
-        this.buildRpcBody("attach"),
+        attachBody,
         { timeoutMs: 60000 }
       );
       if (!attachResult || attachResult.ok === false) {
@@ -745,11 +750,36 @@ class CursorSidecarPlugin extends Plugin {
       this.notify("Enable Embedded Agents Pane [Experimental] in settings first.", true);
       return;
     }
+    if (this._nativeOpenBusy) {
+      this.notify("Native Agents Pane: already opening…");
+      return;
+    }
+    this._nativeOpenBusy = true;
+    try {
+      await this._openNativeAgentsPaneInner();
+    } finally {
+      this._nativeOpenBusy = false;
+    }
+  }
+
+  async _openNativeAgentsPaneInner() {
     this.settings.embedBackend = "native_child";
     await this.saveSettings();
     const attached = await this.ensureAttachedForEmbed();
     if (!attached) {
       this.notify("Open Native Agents Pane aborted: auto-Attach failed.", true);
+      return;
+    }
+    // Re-check live status — attach race previously caused sidecar_not_attached
+    try {
+      const st = await this.httpJson("GET", "/status");
+      const status = (st && st.status) || st || {};
+      if (status.attached !== true) {
+        this.notify("Open Native Agents Pane aborted: still not attached.", true);
+        return;
+      }
+    } catch (_e) {
+      this.notify("Open Native Agents Pane aborted: status check failed.", true);
       return;
     }
     const leaf = await this.ensureAgentsPaneLeaf();
@@ -833,6 +863,12 @@ class CursorSidecarPlugin extends Plugin {
         `Native Agents Pane OK hwnd=${result.agent_hwnd} parent=${result.agent_parent_hwnd}`
       );
       this.schedulePaneRectUpdate();
+      // Put keyboard focus into Agents so typing does not land in the note
+      try {
+        await this.httpJson("POST", "/rpc", { cmd: "focus-agents-window" });
+      } catch (_e) {
+        /* ignore */
+      }
     } catch (err) {
       this._setEmbedActive(false);
       this._nativeVerified = false;
