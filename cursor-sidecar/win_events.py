@@ -30,12 +30,19 @@ from window import (
 log = logging.getLogger("cursor_sidecar.live")
 
 # WinEvent constants
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_SYSTEM_CAPTURESTART = 0x0008
+EVENT_SYSTEM_CAPTUREEND = 0x0009
 EVENT_SYSTEM_MOVESIZESTART = 0x000A
 EVENT_SYSTEM_MOVESIZEEND = 0x000B
 EVENT_SYSTEM_MINIMIZESTART = 0x0016
 EVENT_SYSTEM_MINIMIZEEND = 0x0017
 EVENT_OBJECT_DESTROY = 0x8001
 EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+
+# Native-child hit-test keepalive (Electron SetParent quirk)
+_NATIVE_NUDGE_INTERVAL_S = 0.35
+_NATIVE_NUDGE_DEBOUNCE_S = 0.05
 
 WINEVENT_OUTOFCONTEXT = 0x0000
 WINEVENT_SKIPOWNPROCESS = 0x0002
@@ -109,6 +116,9 @@ class LiveFollowService:
             max(self.debounce_ms, 1) / 1000.0,
             lambda: self._follow_cursor(reason="debounced"),
         )
+        self._nudge_thread: Optional[threading.Thread] = None
+        self._nudge_timer: Optional[threading.Timer] = None
+        self._nudge_lock = threading.Lock()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -154,6 +164,12 @@ class LiveFollowService:
             daemon=True,
         )
         self._thread.start()
+        self._nudge_thread = threading.Thread(
+            target=self._native_nudge_loop,
+            name="sidecar-native-nudge",
+            daemon=True,
+        )
+        self._nudge_thread.start()
         # brief wait for hook install
         for _ in range(50):
             if self.hook_installed:
@@ -164,6 +180,7 @@ class LiveFollowService:
     def stop(self) -> None:
         """Stop hook thread. Safe to call from the hook callback (no self-join)."""
         self._debouncer.cancel()
+        self._cancel_nudge_timer()
         self._stop.set()
         tid = self._thread_id
         on_hook_thread = tid is not None and threading.get_ident() == tid
@@ -179,7 +196,11 @@ class LiveFollowService:
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=2.0)
+        nt = self._nudge_thread
+        if nt and nt.is_alive() and threading.get_ident() != nt.ident:
+            nt.join(timeout=1.0)
         self._thread = None
+        self._nudge_thread = None
         self._thread_id = None
         self.running = False
         self.hook_installed = False
@@ -199,6 +220,7 @@ class LiveFollowService:
             self._callback_ref = WinEventProcType(self._on_event)
             flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
             ranges = (
+                (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_CAPTUREEND),
                 (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MINIMIZEEND),
                 (EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE),
             )
@@ -261,6 +283,100 @@ class LiveFollowService:
             return
         self.dispatch_win_event(int(event), hwnd_i)
 
+    def _is_agent_tree(self, hwnd_i: int) -> bool:
+        """True if hwnd is agent_hwnd or a descendant (Electron chrome lives in children)."""
+        ah = int(self.agent_hwnd or 0)
+        if not ah or not hwnd_i:
+            return False
+        h = int(hwnd_i)
+        for _ in range(40):
+            if h == ah:
+                return True
+            if h == int(self.obsidian_hwnd or 0):
+                return False
+            try:
+                h = int(win32gui.GetParent(h) or 0)
+            except Exception:
+                return False
+            if not h:
+                return False
+        return False
+
+    def _mouse_buttons_up(self) -> bool:
+        try:
+            import win32api
+
+            # High bit set => currently down
+            return (win32api.GetAsyncKeyState(0x01) & 0x8000) == 0 and (
+                win32api.GetAsyncKeyState(0x02) & 0x8000
+            ) == 0
+        except Exception:
+            return True
+
+    def _cancel_nudge_timer(self) -> None:
+        with self._nudge_lock:
+            t = self._nudge_timer
+            self._nudge_timer = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def schedule_native_nudge(self, reason: str = "") -> None:
+        """Debounced hit-test refresh for native_child Agents pane."""
+        if self.embed_backend != "native_child" or self.follow_mode != "pane":
+            return
+        if not self.agent_hwnd:
+            return
+
+        def _fire() -> None:
+            with self._nudge_lock:
+                self._nudge_timer = None
+            self._nudge_native_child(reason=reason or "debounced")
+
+        with self._nudge_lock:
+            if self._nudge_timer is not None:
+                try:
+                    self._nudge_timer.cancel()
+                except Exception:
+                    pass
+            self._nudge_timer = threading.Timer(_NATIVE_NUDGE_DEBOUNCE_S, _fire)
+            self._nudge_timer.daemon = True
+            self._nudge_timer.start()
+
+    def _nudge_native_child(self, reason: str = "") -> None:
+        if self._stop.is_set():
+            return
+        if self.embed_backend != "native_child" or self.follow_mode != "pane":
+            return
+        if self.obsidian_user_moving or self._self_applying:
+            return
+        if not self._mouse_buttons_up():
+            return
+        ah = int(self.agent_hwnd or 0)
+        if not ah:
+            return
+        try:
+            from native_embed import nudge_native_child
+
+            self._self_applying = True
+            self._suppress_until = time.time() + 0.15
+            result = nudge_native_child(ah)
+            if self.debug:
+                log.debug("native-nudge[%s] -> %s", reason, result)
+        except Exception as exc:
+            log.error("native nudge error: %s", exc)
+        finally:
+            self._self_applying = False
+
+    def _native_nudge_loop(self) -> None:
+        """Periodic safety net: same SetWindowPos refresh that Obsidian drag triggers."""
+        while not self._stop.wait(_NATIVE_NUDGE_INTERVAL_S):
+            if not self.enabled or not self.running:
+                continue
+            self._nudge_native_child(reason="keepalive")
+
     def dispatch_win_event(self, event: int, hwnd_i: int) -> str:
         """Route a WinEvent. Public for unit tests; does not require a live OS hook."""
         # Cursor destroy must be handled even though we ignore other Cursor events
@@ -272,6 +388,20 @@ class LiveFollowService:
         # Ignore our own SetWindowPos echo (defense in depth; we filter to Obsidian)
         if hwnd_i == self.cursor_hwnd and time.time() < self._suppress_until:
             return "ignore_suppress"
+
+        # Agent / Electron chrome: restore hit-test after click/focus churn
+        if self.embed_backend == "native_child" and self._is_agent_tree(hwnd_i):
+            if event in (EVENT_SYSTEM_CAPTUREEND, EVENT_SYSTEM_FOREGROUND):
+                self.last_event = (
+                    "AGENT_CAPTUREEND" if event == EVENT_SYSTEM_CAPTUREEND else "AGENT_FOREGROUND"
+                )
+                self.schedule_native_nudge(reason=self.last_event)
+                return self.last_event
+            if event == EVENT_OBJECT_DESTROY and hwnd_i == int(self.agent_hwnd or 0):
+                self.last_event = "AGENT_DESTROY"
+                self.agent_hwnd = 0
+                return "AGENT_DESTROY"
+            return "ignore_agent"
 
         if hwnd_i != self.obsidian_hwnd:
             return "ignore_hwnd"

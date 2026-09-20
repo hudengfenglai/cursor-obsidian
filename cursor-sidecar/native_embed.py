@@ -182,6 +182,48 @@ def place_child_in_client(hwnd: int, client_rect: dict[str, int]) -> None:
     )
 
 
+def nudge_native_child(hwnd: int) -> dict[str, Any]:
+    """Refresh hit-testing after Electron chrome clicks without moving the child.
+
+    SetParent + Electron often loses mouse hit-test after one in-content click
+    (e.g. Agents "Editor Window") until the next SetWindowPos — which is why
+    dragging Obsidian temporarily "fixes" clicks. This is that SetWindowPos.
+    """
+    hwnd = int(hwnd or 0)
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return {"ok": False, "error": "agent_gone"}
+    try:
+        # Re-assert Z-order among Obsidian children, then frame-change.
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            win32con.SWP_NOMOVE
+            | win32con.SWP_NOSIZE
+            | win32con.SWP_NOACTIVATE
+            | win32con.SWP_SHOWWINDOW
+            | win32con.SWP_FRAMECHANGED,
+        )
+        try:
+            win32gui.RedrawWindow(
+                hwnd,
+                None,
+                None,
+                win32con.RDW_INVALIDATE
+                | win32con.RDW_ERASE
+                | win32con.RDW_FRAME
+                | win32con.RDW_ALLCHILDREN,
+            )
+        except Exception:
+            pass
+        return {"ok": True, "applied": "nudge"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def read_dpi(hwnd: int) -> Optional[int]:
     try:
         return int(win32api.GetDpiForWindow(int(hwnd)))

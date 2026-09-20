@@ -34,6 +34,8 @@ const DEFAULT_SETTINGS = {
 const CONTEXT_FOLLOW_DEBOUNCE_MS = 150;
 const CONTEXT_FOLLOW_SUPPRESS_MS = 400;
 const PANE_RECT_THROTTLE_MS = 32;
+/** Native SetParent: Electron loses hit-test after chrome clicks until SetWindowPos. */
+const EMBED_HITTEST_KEEPALIVE_MS = 400;
 
 /** Rebase local seq against daemon latest_seq + clock (plugin reload safe). */
 function nextContextSyncSeq(localSeq, daemonSeq, nowMs) {
@@ -264,13 +266,14 @@ class CursorSidecarPlugin extends Plugin {
     addIcon(ICON_ID, ICON_SVG);
 
     this._embeddedPaneView = null;
-    this._embedActive = false;
+    this._setEmbedActive(false);
     this._nativeVerified = false;
     this._commandBusy = false;
     this._runtimeInfo = null;
     this._paneRaf = null;
     this._paneLastSentAt = 0;
     this._paneThrottleTimer = null;
+    this._embedKeepaliveTimer = null;
     this._lastEmbedDiag = null;
 
     this.registerView(VIEW_TYPE_EMBEDDED_PANE, (leaf) => new CursorSidecarPaneView(leaf, this));
@@ -458,6 +461,7 @@ class CursorSidecarPlugin extends Plugin {
       this._cfTimer = null;
     }
     this._cfGen += 1;
+    this._stopEmbedKeepalive();
     if (this._paneRaf) {
       cancelAnimationFrame(this._paneRaf);
       this._paneRaf = null;
@@ -508,6 +512,29 @@ class CursorSidecarPlugin extends Plugin {
     });
   }
 
+  _startEmbedKeepalive() {
+    if (this._embedKeepaliveTimer) return;
+    this._embedKeepaliveTimer = window.setInterval(() => {
+      if (!this._embedActive) {
+        this._stopEmbedKeepalive();
+        return;
+      }
+      this.schedulePaneRectUpdate();
+    }, EMBED_HITTEST_KEEPALIVE_MS);
+  }
+
+  _stopEmbedKeepalive() {
+    if (!this._embedKeepaliveTimer) return;
+    clearInterval(this._embedKeepaliveTimer);
+    this._embedKeepaliveTimer = null;
+  }
+
+  _setEmbedActive(on) {
+    this._embedActive = !!on;
+    if (this._embedActive) this._startEmbedKeepalive();
+    else this._stopEmbedKeepalive();
+  }
+
   async flushPaneRectUpdate() {
     if (!this._embedActive) return;
     const view = this._embeddedPaneView;
@@ -523,7 +550,7 @@ class CursorSidecarPlugin extends Plugin {
       }
       const result = await this.httpJson("POST", "/rpc", body);
       if (result && result.error === "agent_window_closed") {
-        this._embedActive = false;
+        this._setEmbedActive(false);
         if (view && view.renderPaneUi) view.renderPaneUi("closed");
         return;
       }
@@ -769,7 +796,7 @@ class CursorSidecarPlugin extends Plugin {
         { timeoutMs: 90000 }
       );
       if (!result || result.ok === false) {
-        this._embedActive = false;
+        this._setEmbedActive(false);
         this._nativeVerified = false;
         const detail = this._formatNativeFail(result);
         view.renderPaneUi("failed", detail);
@@ -782,14 +809,14 @@ class CursorSidecarPlugin extends Plugin {
         !!emb.native_child ||
         !!emb.is_native_child;
       if (!verified) {
-        this._embedActive = false;
+        this._setEmbedActive(false);
         this._nativeVerified = false;
         const detail = this._formatNativeFail(result);
         view.renderPaneUi("failed", detail);
         this.notify(`Native NOT verified: ${detail}`, true);
         return;
       }
-      this._embedActive = true;
+      this._setEmbedActive(true);
       this._nativeVerified = true;
       view.renderPaneUi("anchor");
       this._lastEmbedDiag = {
@@ -807,7 +834,7 @@ class CursorSidecarPlugin extends Plugin {
       );
       this.schedulePaneRectUpdate();
     } catch (err) {
-      this._embedActive = false;
+      this._setEmbedActive(false);
       this._nativeVerified = false;
       view.renderPaneUi("failed", String(err.message || err));
       this.notify(`Native Agents Pane error: ${err.message || err}`, true);
@@ -880,7 +907,7 @@ class CursorSidecarPlugin extends Plugin {
       });
       if (!result || result.ok === false) {
         const err = (result && result.error) || "enter-embedded-pane failed";
-        this._embedActive = false;
+        this._setEmbedActive(false);
         this._nativeVerified = false;
         if (err === "agent_not_bound") {
           this.notify("Bind Agents Window first.", true);
@@ -902,13 +929,13 @@ class CursorSidecarPlugin extends Plugin {
           !!emb.native_child ||
           !!emb.is_native_child;
         if (!verified) {
-          this._embedActive = false;
+          this._setEmbedActive(false);
           this._nativeVerified = false;
           this.notify(`Native embed NOT verified: ${this._formatNativeFail(result)}`, true);
           if (view.renderPaneUi) view.renderPaneUi("ready");
           return;
         }
-        this._embedActive = true;
+        this._setEmbedActive(true);
         this._nativeVerified = true;
         view.renderPaneUi("anchor");
         this._lastEmbedDiag = {
@@ -925,14 +952,14 @@ class CursorSidecarPlugin extends Plugin {
         this.schedulePaneRectUpdate();
         return;
       }
-      this._embedActive = true;
+      this._setEmbedActive(true);
       this._nativeVerified = false;
       view.renderPaneUi("embedded");
       this._lastEmbedDiag = { dom: pane, placement: result.placement };
       this.notify("Agents Window embedded in pane (visual)");
       this.schedulePaneRectUpdate();
     } catch (err) {
-      this._embedActive = false;
+      this._setEmbedActive(false);
       this._nativeVerified = false;
       this.notify(`Embed error: ${err.message || err}`, true);
     }
@@ -940,7 +967,7 @@ class CursorSidecarPlugin extends Plugin {
 
   async exitEmbeddedMode({ closePane = false, fromViewClose = false } = {}) {
     const wasActive = this._embedActive;
-    this._embedActive = false;
+    this._setEmbedActive(false);
     this._nativeVerified = false;
     try {
       if (wasActive && (await this.daemonHealthy())) {
@@ -977,7 +1004,7 @@ class CursorSidecarPlugin extends Plugin {
         this.notify(`Recover failed: ${String((result && result.error) || "rpc")}`, true);
         return;
       }
-      this._embedActive = false;
+      this._setEmbedActive(false);
       this.notify("Native Agents Window recovered");
       await this.refreshAgentsPaneUi();
     } catch (err) {
@@ -1639,13 +1666,13 @@ class CursorSidecarPlugin extends Plugin {
           } else if (result.attached === true) {
             this.notify("Cursor Sidecar: attached");
           } else if (result.attached === false) {
-            this._embedActive = false;
+            this._setEmbedActive(false);
             this.notify("Cursor Sidecar: detached (windows restored)");
           } else {
             this.notify(`Cursor Sidecar: ${cmd} ok`);
           }
           if (cmd === "detach") {
-            this._embedActive = false;
+            this._setEmbedActive(false);
           }
           return result;
         }
